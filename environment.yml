@@ -1,0 +1,31 @@
+name: walberla
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - setuptools
+  - astor
+  - pybind11
+  - pylint
+  - pytest
+  - pytest-rerunfailures
+  - pytest-xdist
+  - eigen
+  - numpy
+  - scipy
+  - GitPython
+  - coverage
+  - colorama
+  - autograd
+  - ipython
+  - jupyter
+  - matplotlib
+  - scikit-sparse
+  - sympy
+  - pip
+  - pip:
+    - pycuda
+    - sourceinspect
+    - ipdb
+    - pystencils[interactive,gpu,alltrafos,autodiff,doc]
+    - lbmpy[interactive,gpu,alltrafos,doc]
