@@ -3,7 +3,10 @@
 #include "blockforest/Initialization.h"
 #include "blockforest/communication/all.h"
 
+#include "core/logging/all.h"
+
 #include "pe/basic.h"
+#include "pe/Types.h"
 
 #include <tuple>
 
@@ -33,20 +36,36 @@ struct Setup
     real_t particle_diameter_1; // particle diamter first type
     real_t particle_diameter_2; // particle diamter second type
     real_t particle_diameter_avg; // average particle diameter
+    real_t particle_volume_avg; // average particle volume
+    real_t particle_mass_avg; // average particle mass
+
+    real_t restitutionCoeff; // Coefficient of restitution
+    real_t frictionSCoeff; // Coefficient of static friction
+    real_t frictionDCoeff; // Coefficient of dynamic friction
+    real_t poisson; // Poisson's ratio
+    real_t young; // Young's modulus
+    real_t stiffnessCoeff; // contact stiffness
+    real_t dampingNCoeff; // damping coefficient in the normal direction
+    real_t dampingTCoeff; // damping coefficient in the tangential direction
+
+    // output parameters
+    std::string vtkBaseFolder;
 
     void printSetup()
     {
-        WALBERLA_LOG_DEVEL_ON_ROOT(numBlocks);
-        WALBERLA_LOG_DEVEL_ON_ROOT(domainSize);
-        WALBERLA_LOG_DEVEL_ON_ROOT(isPeriodic);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(numBlocks);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(domainSize);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(isPeriodic);
 
-        WALBERLA_LOG_DEVEL_ON_ROOT(particle_density);
-        WALBERLA_LOG_DEVEL_ON_ROOT(fluid_density);
-        WALBERLA_LOG_DEVEL_ON_ROOT(density_ratio);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_density);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(fluid_density);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(density_ratio);
 
-        WALBERLA_LOG_DEVEL_ON_ROOT(particle_diameter_1);
-        WALBERLA_LOG_DEVEL_ON_ROOT(particle_diameter_2);
-        WALBERLA_LOG_DEVEL_ON_ROOT(particle_diameter_avg);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_1);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_2);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_avg);
+
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(vtkBaseFolder);
     }
 
     void sanity_check()
@@ -100,21 +119,62 @@ int main(int argc, char** argv)
     setup.particle_diameter_1 = materialProperties.getParameter< real_t >("particle_diameter_1");
     setup.particle_diameter_2 = materialProperties.getParameter< real_t >("particle_diameter_2");
     setup.particle_diameter_avg = (setup.particle_diameter_1 + setup.particle_diameter_2) / real_t(2.0);
+    setup.particle_volume_avg = setup.particle_diameter_avg * setup.particle_diameter_avg * setup.particle_diameter_avg * math::pi / real_t(6.0);
+    setup.particle_mass_avg = setup.density_ratio * setup.particle_volume_avg;
+
+    // collision related material properties
+    setup.restitutionCoeff = materialProperties.getParameter< real_t >("restitutionCoeff");
+    setup.frictionSCoeff = materialProperties.getParameter< real_t >("frictionSCoeff");
+    setup.frictionDCoeff = materialProperties.getParameter< real_t >("frictionDCoeff");
+    setup.poisson = materialProperties.getParameter< real_t >("poisson");
+    setup.young = materialProperties.getParameter< real_t >("young");
+
+    setup.stiffnessCoeff = 0.0;
+    setup.dampingNCoeff = 0.0;
+    setup.dampingTCoeff = 0.0;
+
+    // define particle material
+    auto peMaterial = pe::createMaterial("particleMat", setup.density_ratio, setup.restitutionCoeff, 
+    setup.frictionSCoeff, setup.frictionDCoeff, setup.poisson, setup.young, 
+    setup.stiffnessCoeff, setup.dampingNCoeff, setup.dampingTCoeff);
 
     auto outputParameters = env.config()->getOneBlock("OutputParameters");
-    //pending
+    setup.vtkBaseFolder = outputParameters.getParameter< std::string >("vtkBaseFolder");
 
     // check sanity of input parameters
     //setup.sanity_check();
-
-    std::cout << std::boolalpha;
-    std::cout << setup.isPeriodic[0] << std::endl;
     
     setup.printSetup();
 
     ////////////////////////////
     // simulation setup
     ////////////////////////////
+    
+    // simulation domain
+    const auto domainAABB = AABB(real_c(0.0), real_c(0.0), real_c(0.0), 
+    real_c(setup.domainSize[0]), real_c(setup.domainSize[1]), real_c(setup.domainSize[2]) );
+
+    // create blockforect
+    auto forest = blockforest::createBlockForest(domainAABB, setup.numBlocks, setup.isPeriodic);
+
+    // generate IDs of specified PE body types
+    pe::SetBodyTypeIDs< BodyTypeTuple >::execute();
+
+    // add global body storage for PE bodies
+    shared_ptr< pe::BodyStorage > globalBodyStorage = make_shared< pe::BodyStorage >();
+
+    // add block-local body storage
+    const auto bodyStorageID = forest->addBlockData(pe::createStorageDataHandling< BodyTypeTuple >(), "bodyStorage");
+
+    // add data-handling for coarse collision dection
+    const auto ccdID = forest->addBlockData(pe::ccd::createHashGridsDataHandling(globalBodyStorage, bodyStorageID), "ccd");
+
+    // add data-handling for fine collision dection
+    const auto fcdID = forest->addBlockData(pe::fcd::createGenericFCDDataHandling< BodyTypeTuple, pe::fcd::AnalyticCollideFunctor >(), "fcd");
+
+    // add contact solver - DEM soft contacts
+    const auto cr = make_shared< pe::cr::DEM >(globalBodyStorage, forest, bodyStorageID, ccdID, fcdID);
+
 
     return EXIT_SUCCESS;
 }
