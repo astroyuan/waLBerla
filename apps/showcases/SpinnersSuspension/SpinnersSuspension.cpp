@@ -44,6 +44,7 @@ struct Setup
     real_t frictionDCoeff; // Coefficient of dynamic friction
     real_t poisson; // Poisson's ratio
     real_t young; // Young's modulus
+    real_t contactT; // contact time
     real_t stiffnessCoeff; // contact stiffness
     real_t dampingNCoeff; // damping coefficient in the normal direction
     real_t dampingTCoeff; // damping coefficient in the tangential direction
@@ -64,6 +65,8 @@ struct Setup
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_1);
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_2);
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_diameter_avg);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_volume_avg);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_mass_avg);
 
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(vtkBaseFolder);
     }
@@ -128,10 +131,17 @@ int main(int argc, char** argv)
     setup.frictionDCoeff = materialProperties.getParameter< real_t >("frictionDCoeff");
     setup.poisson = materialProperties.getParameter< real_t >("poisson");
     setup.young = materialProperties.getParameter< real_t >("young");
+    setup.contactT = materialProperties.getParameter< real_t >("contactT");
 
-    setup.stiffnessCoeff = 0.0;
-    setup.dampingNCoeff = 0.0;
-    setup.dampingTCoeff = 0.0;
+    real_t mij = setup.particle_mass_avg * setup.particle_mass_avg / (setup.particle_mass_avg + setup.particle_mass_avg);
+
+    setup.stiffnessCoeff = math::pi * math::pi * mij / (setup.contactT * setup.contactT * (real_t(1.0) - 
+    std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff) / 
+    (math::pi * math::pi + std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
+
+    setup.dampingNCoeff = -real_t(2.0) * std::sqrt(mij * setup.stiffnessCoeff) * (std::log(setup.restitutionCoeff) / 
+    std::sqrt(math::pi * math::pi + (std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
+    setup.dampingTCoeff = setup.dampingNCoeff;
 
     // define particle material
     auto peMaterial = pe::createMaterial("particleMat", setup.density_ratio, setup.restitutionCoeff, 
@@ -149,7 +159,7 @@ int main(int argc, char** argv)
     ////////////////////////////
     // simulation setup
     ////////////////////////////
-    
+
     // simulation domain
     const auto domainAABB = AABB(real_c(0.0), real_c(0.0), real_c(0.0), 
     real_c(setup.domainSize[0]), real_c(setup.domainSize[1]), real_c(setup.domainSize[2]) );
