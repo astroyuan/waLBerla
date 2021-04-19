@@ -11,18 +11,51 @@
 #include "pe/utility/DestroyBody.h"
 #include "pe/vtk/SphereVtkOutput.h"
 
+#include "lbm/boundary/all.h"
+#include "lbm/communication/PdfFieldPackInfo.h"
+#include "lbm/field/AddToStorage.h"
+#include "lbm/field/PdfField.h"
+#include "lbm/lattice_model/D2Q9.h"
+#include "lbm/sweeps/CellwiseSweep.h"
+#include "lbm/sweeps/SweepWrappers.h"
+#include "lbm/vtk/all.h"
+
 #include "vtk/VTKOutput.h"
 
 #include <tuple>
 
 namespace spinners_suspension
 {
-// typedefs
+// using
 using namespace walberla;
 using walberla::uint_t;
 
+// typedefs
+using LatticeModel_T = lbm::D2Q9<lbm::collision_model::TRT, false>;
+const real_t magicNumberTRT = lbm::collision_model::TRT::threeSixteenth;
+
+using Stencil_T = LatticeModel_T::Stencil;
+using PdfField_T = lbm::PdfField<LatticeModel_T>;
+
+using flag_t = walberla::uint8_t;
+using FlagField_T = FlagField<flag_t>;
+using BodyField_T = GhostLayerField<pe::BodyID, 1>;
+
+const uint_t FieldGhostLayers = 1;
+
+// boundary handling
+
+
 // body types
 using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
+
+// flags
+
+const FlagUID Fluid_Flag ( "fluid" );
+
+const FlagUID MEM_Flag ("moving obstacle");
+
+const FlagUID FormerMEM_Flag ( "former moving obstacle" );
 
 /////////////////////
 // parameters
@@ -33,9 +66,9 @@ struct Setup
     Vector3< uint_t > numBlocks; // number of blocks in x,y,z direction
     Vector3< uint_t > domainSize; // domian size in x,y,z direction
     Vector3< bool > isPeriodic; // whether periodic in x,y,z direction
-    bool boundX;
-    bool boundY;
-    bool boundZ;
+    bool boundX; // bounding walls in x-axis
+    bool boundY; // bounding walls in y-axis
+    bool boundZ; // bounding walls in z-axis
 
     // simulation parameters
     uint_t timesteps; // simulation time steps
@@ -44,10 +77,13 @@ struct Setup
 
     uint_t substepsPE; // number of PE calls in each subcycle
 
-    // material properties
-    real_t particle_density; // density of particles
+    // fluid properties
     real_t fluid_density; // density of fluid
-    real_t density_ratio;
+    real_t viscosity; // viscosity of fluid
+    real_t omega;
+
+    // particle properties
+    real_t particle_density; // density of particles
 
     uint_t numParticles; // number of particles
 
@@ -69,6 +105,8 @@ struct Setup
     real_t stiffnessCoeff; // contact stiffness
     real_t dampingNCoeff; // damping coefficient in the normal direction
     real_t dampingTCoeff; // damping coefficient in the tangential direction
+
+    real_t density_ratio;
 
     // output parameters
     std::string vtkBaseFolder;
@@ -204,27 +242,32 @@ int main(int argc, char** argv)
     setup.dx = simulationParameters.getParameter< real_t >("dx");
     setup.substepsPE = simulationParameters.getParameter< uint_t >("substepsPE");
 
-    auto materialProperties = env.config()->getOneBlock("MaterialProperties");
-    setup.particle_density = materialProperties.getParameter< real_t >("particle_density");
-    setup.fluid_density = materialProperties.getParameter< real_t >("fluid_density");
+    auto fluidProperties = env.config()->getOneBlock("FluidProperties");
+    setup.fluid_density = fluidProperties.getParameter< real_t >("fluid_density");
+    setup.viscosity = fluidProperties.getParameter< real_t >("viscosity");
+    setup.omega = lbm::collision_model::omegaFromViscosity(setup.viscosity);
+
+    auto particleProperties = env.config()->getOneBlock("ParticleProperties");
+    setup.particle_density = particleProperties.getParameter< real_t >("particle_density");
+    setup.fluid_density = particleProperties.getParameter< real_t >("fluid_density");
     setup.density_ratio = setup.particle_density / setup.fluid_density;
 
-    setup.particle_number_1 = materialProperties.getParameter< uint_t >("particle_number_1");
-    setup.particle_number_2 = materialProperties.getParameter< uint_t >("particle_number_2");
-    setup.particle_diameter_1 = materialProperties.getParameter< real_t >("particle_diameter_1");
-    setup.particle_diameter_2 = materialProperties.getParameter< real_t >("particle_diameter_2");
+    setup.particle_number_1 = particleProperties.getParameter< uint_t >("particle_number_1");
+    setup.particle_number_2 = particleProperties.getParameter< uint_t >("particle_number_2");
+    setup.particle_diameter_1 = particleProperties.getParameter< real_t >("particle_diameter_1");
+    setup.particle_diameter_2 = particleProperties.getParameter< real_t >("particle_diameter_2");
     setup.particle_diameter_max = std::max(setup.particle_diameter_1, setup.particle_diameter_2);
     setup.particle_diameter_avg = (setup.particle_diameter_1 + setup.particle_diameter_2) / real_t(2.0);
     setup.particle_volume_avg = setup.particle_diameter_avg * setup.particle_diameter_avg * setup.particle_diameter_avg * math::pi / real_t(6.0);
     setup.particle_mass_avg = setup.density_ratio * setup.particle_volume_avg;
 
     // collision related material properties
-    setup.restitutionCoeff = materialProperties.getParameter< real_t >("restitutionCoeff");
-    setup.frictionSCoeff = materialProperties.getParameter< real_t >("frictionSCoeff");
-    setup.frictionDCoeff = materialProperties.getParameter< real_t >("frictionDCoeff");
-    setup.poisson = materialProperties.getParameter< real_t >("poisson");
-    setup.young = materialProperties.getParameter< real_t >("young");
-    setup.contactT = materialProperties.getParameter< real_t >("contactT");
+    setup.restitutionCoeff = particleProperties.getParameter< real_t >("restitutionCoeff");
+    setup.frictionSCoeff = particleProperties.getParameter< real_t >("frictionSCoeff");
+    setup.frictionDCoeff = particleProperties.getParameter< real_t >("frictionDCoeff");
+    setup.poisson = particleProperties.getParameter< real_t >("poisson");
+    setup.young = particleProperties.getParameter< real_t >("young");
+    setup.contactT = particleProperties.getParameter< real_t >("contactT");
 
     real_t mij = setup.particle_mass_avg * setup.particle_mass_avg / (setup.particle_mass_avg + setup.particle_mass_avg);
 
@@ -271,7 +314,6 @@ int main(int argc, char** argv)
 
     const auto domainSimulation = AABB(real_c(0.0), real_c(0.0), real_c(0.0),
     real_c(setup.domainSize[0]), real_c(setup.domainSize[1]), real_c(setup.domainSize[2]) );
-    
 
     // create blockforect
     //auto forest = blockforest::createBlockForest(domainSimulation, setup.numBlocks, setup.isPeriodic);
@@ -341,24 +383,45 @@ int main(int argc, char** argv)
         WALBERLA_LOG_INFO_ON_ROOT("Bounding walls in the x direction created.");
     }
 
+    // set up synchronization procedure
+    const real_t overlap = real_c( 1.5 ) * setup.dx;
+    std::function<void(void)> syncCall;
+    if ( XBlocks <= uint_t(4) )
+        syncCall = std::bind( pe::syncNextNeighbors<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
+    else
+        syncCall = std::bind( pe::syncShadowOwners<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
+
     ////////////////////////////
     // Initialization
     ////////////////////////////
 
     // generate initial spherical particles
-    real_t layer_thickness = setup.particle_diameter_avg * real_c(1.5);
-    real_t layer_zoffset = setup.particle_diameter_avg * real_c(0.0);
+
+    real_t layer_thickness = setup.dx;
+    real_t layer_zpos = real_c(0.5) * setup.dx;
     real_t radius_max = setup.particle_diameter_max / real_c(2.0);
-    const auto domainGeneration = AABB(radius_max, radius_max, radius_max + layer_zoffset, real_c(Lx) - radius_max, real_c(Ly) - radius_max, layer_thickness + layer_zoffset);
+    const auto domainGeneration = AABB(domainSimulation.xMin() + radius_max, domainSimulation.yMin() + radius_max, domainSimulation.zMin(), 
+                                       domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
 
     // collision properties evaluator
     auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
 
     // random generation of spherical particles
-    setup.numParticles = generateRandomSpheres(*blocks, *globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial);
+    setup.numParticles = generateRandomSpheresLayer(*blocks, *globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
     // sync the created particles between processes
-    pe::syncShadowOwners< BodyTypeTuple >(blocks->getBlockForest(), bodyStorageID);
+    syncCall();
+
     WALBERLA_LOG_INFO_ON_ROOT(setup.numParticles << " spheres created.");
+
+    //
+    // Add data to blocks
+    //
+
+    // create the lattice model
+    LatticeModel_T latticeModel = LatticeModel_T( lbm::collision_model::TRT::constructWithMagicNumber( setup.omega, magicNumberTRT));
+
+    // add pdf field
+    BlockDataID pdfFieldID = lbm::addPdfFieldToStorage< LatticeModel_T >( blocks, "pdf field (zyxf)", latticeModel, uInfty, rhoInit, FieldGhostLayers, field::zyxf);
 
     //-------------
     // Output setup
@@ -377,7 +440,7 @@ int main(int argc, char** argv)
     const real_t overlapTarget = real_t(0.01) * setup.particle_diameter_avg;
 
     // temperary bounding plane
-    auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
+    //auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
 
     for (uint_t pestep = uint_c(0); pestep < initialPEsteps; ++pestep)
     {
@@ -410,7 +473,7 @@ int main(int argc, char** argv)
     }
 
     // destroy temperary bounding plane
-    pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
+    //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
 
     // comunication
     pe::syncShadowOwners< BodyTypeTuple >(blocks->getBlockForest(), bodyStorageID);
@@ -423,8 +486,8 @@ int main(int argc, char** argv)
     return EXIT_SUCCESS;
 }
 
-uint_t generateRandomSpheres(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
-                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material)
+uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
+                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos)
 {
     //Randomly generate certain number of bidisperse spheres inside a specified domain
 
@@ -441,7 +504,8 @@ uint_t generateRandomSpheres(StructuredBlockForest & forest, pe::BodyStorage & g
         {
             xpos = math::realRandom<real_t>(domainGeneration.xMin(), domainGeneration.xMax());
             ypos = math::realRandom<real_t>(domainGeneration.yMin(), domainGeneration.yMax());
-            zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
+            //zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
+            zpos = layer_zpos;
             diameter = setup.particle_diameter_1;
         }
 
@@ -466,7 +530,8 @@ uint_t generateRandomSpheres(StructuredBlockForest & forest, pe::BodyStorage & g
         {
             xpos = math::realRandom<real_t>(domainGeneration.xMin(), domainGeneration.xMax());
             ypos = math::realRandom<real_t>(domainGeneration.yMin(), domainGeneration.yMax());
-            zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
+            //zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
+            zpos = layer_zpos;
             diameter = setup.particle_diameter_2;
         }
 
