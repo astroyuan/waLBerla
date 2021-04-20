@@ -39,7 +39,6 @@ using LatticeModel_T = lbm::D2Q9<lbm::collision_model::TRT, false>;
 const real_t magicNumberTRT = lbm::collision_model::TRT::threeSixteenth;
 
 using Stencil_T = LatticeModel_T::Stencil;
-using CommunicationStencil_T = LatticeModel_T::CommunicationStencil;
 using PdfField_T = lbm::PdfField<LatticeModel_T>;
 
 using flag_t = walberla::uint8_t;
@@ -49,6 +48,7 @@ using BodyField_T = GhostLayerField<pe::BodyID, 1>;
 const uint_t FieldGhostLayers = 1;
 
 // boundary handling
+using NoSlip_T = lbm::NoSlip<LatticeModel_T, flag_t>;
 using UBB_T = lbm::SimpleUBB<LatticeModel_T, flag_t>;
 using Pressure_T = lbm::SimplePressure<LatticeModel_T, flag_t>;
 
@@ -64,6 +64,7 @@ using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
 
 const FlagUID Fluid_Flag ( "fluid" );
 
+const FlagUID NoSlip_Falg ("no slip");
 const FlagUID UBB_Flag ( "velocity bounce back" );
 const FlagUID Pressure_Flag ( "pressure" );
 
@@ -92,7 +93,14 @@ struct Setup
     uint_t timesteps; // simulation time steps
     real_t dt; // time interval
     real_t dx;
-    MEMVariant memVariant; // coupling method
+
+    bool resolve_overlapping; // whether resolve initial particle overlappings
+    uint_t resolve_maxsteps; // max resolve timesteps
+    real_t resolve_dt; // time interval for resolving particle overlappings
+    real_t resolve_target; // target max particle overlappings
+
+    std::string coupling_method;
+    MEMVariant memVariant; // momentum exchange method
 
     uint_t substepsPE; // number of PE calls in each subcycle
 
@@ -235,8 +243,8 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 /////////////////////////
 // auxiliary functions
 /////////////////////////
-uint_t generateRandomSpheres(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
-                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material);
+uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
+                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
 
 class ForceOnBodiesAdder
 {
@@ -327,17 +335,32 @@ int main(int argc, char** argv)
     setup.timesteps = simulationParameters.getParameter< uint_t >("timesteps");
     setup.dt = simulationParameters.getParameter< real_t >("dt");
     setup.dx = simulationParameters.getParameter< real_t >("dx");
+
+    setup.resolve_overlapping = simulationParameters.getParameter< bool >("resolve_overlapping");
+    setup.resolve_maxsteps = simulationParameters.getParameter< uint_t >("resolve_maxsteps");
+    setup.resolve_dt = simulationParameters.getParameter< real_t >("resolve_dt");
+    setup.resolve_target = simulationParameters.getParameter< real_t >("resolve_target");
+
     setup.substepsPE = simulationParameters.getParameter< uint_t >("substepsPE");
-    setup.memVariant = MEMVariant::BB;
+    setup.coupling_method = simulationParameters.getParameter< std::string >("coupling_method");
+    if (setup.coupling_method == "MEM_BB")
+        setup.memVariant = MEMVariant::BB;
+    else if (setup.coupling_method == "MEM_CLI")
+        setup.memVariant = MEMVariant::CLI;
+    else
+        WALBERLA_ABORT("Unsupported Coupling Method.");
 
     auto fluidProperties = env.config()->getOneBlock("FluidProperties");
     setup.fluid_density = fluidProperties.getParameter< real_t >("fluid_density");
     setup.viscosity = fluidProperties.getParameter< real_t >("viscosity");
     setup.omega = lbm::collision_model::omegaFromViscosity(setup.viscosity);
 
+    real_t Re_target = real_c(1.0);
+    real_t uIn = Re_target * setup.viscosity / setup.particle_diameter_avg;
+    Vector3< real_t > uInfty( real_t(0.0), real_t(0.0), uIn);
+
     auto particleProperties = env.config()->getOneBlock("ParticleProperties");
     setup.particle_density = particleProperties.getParameter< real_t >("particle_density");
-    setup.fluid_density = particleProperties.getParameter< real_t >("fluid_density");
     setup.density_ratio = setup.particle_density / setup.fluid_density;
 
     setup.particle_number_1 = particleProperties.getParameter< uint_t >("particle_number_1");
@@ -473,11 +496,11 @@ int main(int argc, char** argv)
 
     // set up synchronization procedure
     const real_t overlap = real_c( 1.5 ) * setup.dx;
-    std::function<void(void)> syncCall;
+    std::function<void(void)> PEsyncCall;
     if ( XBlocks <= uint_t(4) )
-        syncCall = std::bind( pe::syncNextNeighbors<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
+        PEsyncCall = std::bind( pe::syncNextNeighbors<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
     else
-        syncCall = std::bind( pe::syncShadowOwners<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
+        PEsyncCall = std::bind( pe::syncShadowOwners<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
 
     ////////////////////////////
     // Initialization
@@ -491,13 +514,11 @@ int main(int argc, char** argv)
     const auto domainGeneration = AABB(domainSimulation.xMin() + radius_max, domainSimulation.yMin() + radius_max, domainSimulation.zMin(), 
                                        domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
 
-    // collision properties evaluator
-    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
-
     // random generation of spherical particles
     setup.numParticles = generateRandomSpheresLayer(*blocks, *globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
+
     // sync the created particles between processes
-    syncCall();
+    PEsyncCall();
 
     WALBERLA_LOG_INFO_ON_ROOT(setup.numParticles << " spheres created.");
 
@@ -531,8 +552,8 @@ int main(int argc, char** argv)
     //---------------------
     // setup LBM communication scheme
     //---------------------
-    blockforest::communication::UniformBufferedScheme< CommunicationStencil_T > LBMcommScheme( blocks );
-    LBMcommScheme.addPackInfo( make_shared< lbm::PdfFieldPackInfo< LatticeModel_T > >( pdfFieldID ) );
+    blockforest::communication::UniformBufferedScheme< Stencil_T > pdfCommunicationScheme( blocks );
+    pdfCommunicationScheme.addPackInfo( make_shared< lbm::PdfFieldPackInfo< LatticeModel_T > >( pdfFieldID ) );
 
     //-------------
     // Output setup
@@ -544,11 +565,29 @@ int main(int argc, char** argv)
     // add vtk output for particles
     const auto bodyVTKOutput = make_shared< pe::SphereVtkOutput >(bodyStorageID, blocks->getBlockStorage());
     const auto bodyVTKWriter = vtk::createVTKOutput_PointData(bodyVTKOutput, "bodies", setup.vtkWriteFrequency, setup.vtkBaseFolder);
+    bodyVTKWriter->write();
+
+    // add vtk output for fluid
+    auto pdfFieldVTK = vtk::createVTKOutput_BlockData( blocks, "fluid_field", setup.vtkWriteFrequency, 0, false, setup.vtkBaseFolder);
+
+    field::FlagFieldCellFilter< FlagField_T > fluidFilter( flagFieldID );
+    fluidFilter.addFlag( Fluid_Flag );
+    pdfFieldVTK->addCellInclusionFilter( fluidFilter );
+
+    pdfFieldVTK->addCellDataWriter( make_shared< lbm::VelocityVTKWriter< LatticeModel_T, float > >( pdfFieldID, "VelocityFromPDF") );
+    pdfFieldVTK->addCellDataWriter( make_shared< lbm::DensityVTKWriter<LatticeModel_T, float> >( pdfFieldID, "DensityFromPDF") );
+
+    pdfFieldVTK->write();
 
     // resolve particle overlaps
-    const uint_t initialPEsteps = uint_c(100000);
+    if(setup.resolve_overlapping)
+    {
+    // collision properties evaluator
+    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
+
+    const uint_t initialPEsteps = setup.resolve_maxsteps;
     const real_t dt_DEM_init = setup.contactT / real_t(uint_c(10) * setup.substepsPE);
-    const real_t overlapTarget = real_t(0.01) * setup.particle_diameter_avg;
+    const real_t overlapTarget = setup.resolve_target * setup.particle_diameter_avg;
 
     // temperary bounding plane
     //auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
@@ -556,7 +595,7 @@ int main(int argc, char** argv)
     for (uint_t pestep = uint_c(0); pestep < initialPEsteps; ++pestep)
     {
         cr->timestep(dt_DEM_init);
-        pe::syncShadowOwners< BodyTypeTuple >(blocks->getBlockForest(), bodyStorageID);
+        PEsyncCall();
 
         OverlapEvaluator->operator()();
 
@@ -587,8 +626,9 @@ int main(int argc, char** argv)
     //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
 
     // comunication
-    pe::syncShadowOwners< BodyTypeTuple >(blocks->getBlockForest(), bodyStorageID);
+    PEsyncCall();
     bodyVTKWriter->write();
+    }
 
     /////////////////////////
     //  Time loop
