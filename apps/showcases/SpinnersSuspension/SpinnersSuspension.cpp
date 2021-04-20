@@ -20,6 +20,10 @@
 #include "lbm/sweeps/SweepWrappers.h"
 #include "lbm/vtk/all.h"
 
+#include "pe_coupling/mapping/all.h"
+#include "pe_coupling/momentum_exchange_method/all.h"
+#include "pe_coupling/utility/all.h"
+
 #include "vtk/VTKOutput.h"
 
 #include <tuple>
@@ -35,6 +39,7 @@ using LatticeModel_T = lbm::D2Q9<lbm::collision_model::TRT, false>;
 const real_t magicNumberTRT = lbm::collision_model::TRT::threeSixteenth;
 
 using Stencil_T = LatticeModel_T::Stencil;
+using CommunicationStencil_T = LatticeModel_T::CommunicationStencil;
 using PdfField_T = lbm::PdfField<LatticeModel_T>;
 
 using flag_t = walberla::uint8_t;
@@ -44,7 +49,13 @@ using BodyField_T = GhostLayerField<pe::BodyID, 1>;
 const uint_t FieldGhostLayers = 1;
 
 // boundary handling
+using UBB_T = lbm::SimpleUBB<LatticeModel_T, flag_t>;
+using Pressure_T = lbm::SimplePressure<LatticeModel_T, flag_t>;
 
+using MEM_BB_T = pe_coupling::SimpleBB<LatticeModel_T, FlagField_T>;
+using MEM_CLI_T = pe_coupling::CurvedLinear<LatticeModel_T, FlagField_T>;
+
+using BoundaryHandling_T = BoundaryHandling<FlagField_T, Stencil_T, UBB_T, Pressure_T, MEM_BB_T, MEM_CLI_T>;
 
 // body types
 using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
@@ -53,9 +64,16 @@ using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
 
 const FlagUID Fluid_Flag ( "fluid" );
 
-const FlagUID MEM_Flag ("moving obstacle");
+const FlagUID UBB_Flag ( "velocity bounce back" );
+const FlagUID Pressure_Flag ( "pressure" );
+
+const FlagUID MEM_BB_Flag ("moving obstacle BB");
+const FlagUID MEM_CLI_Flag ("moving obstable CLI");
 
 const FlagUID FormerMEM_Flag ( "former moving obstacle" );
+
+// coupling algorithm
+enum MEMVariant {BB, CLI};
 
 /////////////////////
 // parameters
@@ -74,6 +92,7 @@ struct Setup
     uint_t timesteps; // simulation time steps
     real_t dt; // time interval
     real_t dx;
+    MEMVariant memVariant; // coupling method
 
     uint_t substepsPE; // number of PE calls in each subcycle
 
@@ -144,6 +163,74 @@ struct Setup
         WALBERLA_CHECK(particle_diameter_1 > 0 && particle_diameter_2 > 0, "particle diamters should be positive.");
     }
 };
+
+/////////////////////////
+// Boundary conditions
+/////////////////////////
+class MyBoundaryHandling
+{
+public:
+
+    MyBoundaryHandling( const BlockDataID & flagFieldID, const BlockDataID & pdfFieldID, const BlockDataID & bodyFieldID, const Vector3<real_t> & uInfty):
+        flagFieldID_( flagFieldID ), pdfFieldID_( pdfFieldID ), bodyFieldID_( bodyFieldID ), velocity_( uInfty )
+    {}
+
+    BoundaryHandling_T * operator()( IBlock* const block, const StructuredBlockStorage* const storage) const;
+
+private:
+    const BlockDataID flagFieldID_;
+    const BlockDataID pdfFieldID_;
+    const BlockDataID bodyFieldID_;
+    const Vector3<real_t> & velocity_;
+};
+
+BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const StructuredBlockStorage* const storage) const
+{
+    WALBERLA_ASSERT_NOT_NULLPTR( block );
+    WALBERLA_ASSERT_NOT_NULLPTR( storage );
+
+    FlagField_T * flagField = block->getData< FlagField_T >( flagFieldID_ );
+    PdfField_T * pdfField = block->getData< PdfField_T >( pdfFieldID_ );
+    BodyField_T * bodyField = block->getData< BodyField_T >( bodyFieldID_ );
+
+    const auto fluid = flagField->getOrRegisterFlag(Fluid_Flag);
+
+    BoundaryHandling_T * handling = new BoundaryHandling_T("moving obstacle boundary handling", flagField, fluid,
+                                                            UBB_T("UBB", UBB_Flag, pdfField, velocity_),
+                                                            Pressure_T("Pressure", Pressure_Flag, pdfField, real_c(1.0)),
+                                                            MEM_BB_T("MEM_BB", MEM_BB_Flag, pdfField, flagField, bodyField, fluid, *storage, *block),
+                                                            MEM_CLI_T("MEM_CLI", MEM_CLI_Flag, pdfField, flagField, bodyField, fluid, *storage, *block));
+    
+    const auto ubb = flagField->getFlag( UBB_Flag );
+    const auto pressure = flagField->getFlag( Pressure_Flag );
+
+    CellInterval domainBB = storage->getDomainCellBB();
+
+    domainBB.xMin() -= cell_idx_c( FieldGhostLayers );
+    domainBB.xMax() += cell_idx_c( FieldGhostLayers );
+
+    domainBB.yMin() -= cell_idx_c( FieldGhostLayers );
+    domainBB.yMax() += cell_idx_c( FieldGhostLayers );
+
+    // 2D system skip z direction
+
+    // south
+    CellInterval south(domainBB.xMin(), domainBB.yMin(), domainBB.zMin(), domainBB.xMax(), domainBB.yMin(), domainBB.zMin());
+    storage->transformGlobalToBlockLocalCellInterval( south, *block);
+    handling->forceBoundary( ubb, south);
+
+    // north
+    CellInterval north(domainBB.xMin(), domainBB.yMax(), domainBB.zMin(), domainBB.xMax(), domainBB.yMax(), domainBB.zMin());
+    storage->transformGlobalToBlockLocalCellInterval( south, *block);
+    handling->forceBoundary( pressure, north);
+
+    // West and East are periodic
+
+    // fill rest cells as fluid
+    handling->fillWithDomain( domainBB );
+
+    return handling;
+}
 
 /////////////////////////
 // auxiliary functions
@@ -241,6 +328,7 @@ int main(int argc, char** argv)
     setup.dt = simulationParameters.getParameter< real_t >("dt");
     setup.dx = simulationParameters.getParameter< real_t >("dx");
     setup.substepsPE = simulationParameters.getParameter< uint_t >("substepsPE");
+    setup.memVariant = MEMVariant::BB;
 
     auto fluidProperties = env.config()->getOneBlock("FluidProperties");
     setup.fluid_density = fluidProperties.getParameter< real_t >("fluid_density");
@@ -413,15 +501,38 @@ int main(int argc, char** argv)
 
     WALBERLA_LOG_INFO_ON_ROOT(setup.numParticles << " spheres created.");
 
-    //
+    //---------------------
     // Add data to blocks
-    //
+    //---------------------
 
     // create the lattice model
     LatticeModel_T latticeModel = LatticeModel_T( lbm::collision_model::TRT::constructWithMagicNumber( setup.omega, magicNumberTRT));
 
     // add pdf field
-    BlockDataID pdfFieldID = lbm::addPdfFieldToStorage< LatticeModel_T >( blocks, "pdf field (zyxf)", latticeModel, uInfty, rhoInit, FieldGhostLayers, field::zyxf);
+    BlockDataID pdfFieldID = lbm::addPdfFieldToStorage< LatticeModel_T >( blocks, "pdf field (zyxf)", latticeModel, uInfty, real_t(1.0), FieldGhostLayers, field::zyxf);
+
+    // add flag field
+    BlockDataID flagFieldID = field::addFlagFieldToStorage< FlagField_T >( blocks, "flag field" );
+
+    // add body field
+    BlockDataID bodyFieldID = field::addToStorage< BodyField_T >( blocks, "body field", nullptr, field::zyxf);
+
+    // add boundary handling
+    BlockDataID boundaryHandlingID = blocks->addStructuredBlockData< BoundaryHandling_T >( MyBoundaryHandling( flagFieldID, pdfFieldID, bodyFieldID, uInfty) );
+
+    // mapping rigid bodies into LBM grids
+    if ( setup.memVariant == MEMVariant::BB)
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_BB_Flag);
+    else if ( setup.memVariant == MEMVariant::CLI)
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_CLI_Flag);
+    else
+        WALBERLA_ABORT("Unsupported coupling method.");
+
+    //---------------------
+    // setup LBM communication scheme
+    //---------------------
+    blockforest::communication::UniformBufferedScheme< CommunicationStencil_T > LBMcommScheme( blocks );
+    LBMcommScheme.addPackInfo( make_shared< lbm::PdfFieldPackInfo< LatticeModel_T > >( pdfFieldID ) );
 
     //-------------
     // Output setup
