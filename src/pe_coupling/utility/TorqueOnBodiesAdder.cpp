@@ -13,20 +13,38 @@
 //  You should have received a copy of the GNU General Public License along
 //  with waLBerla (see COPYING.txt). If not, see <http://www.gnu.org/licenses/>.
 //
-//! \file all.h
+//! \file TorqueOnBodiesAdder.cpp
 //! \ingroup pe_coupling
-//! \author Florian Schornbaum <florian.schornbaum@fau.de>
-//! \brief Collective header file for module pe_coupling
+//! \author Hang Yuan <johannyuan@gmail.com>
 //
 //======================================================================================================================
 
-#pragma once
-
-#include "BodiesForceTorqueContainer.h"
-#include "BodySelectorFunctions.h"
-#include "ForceOnBodiesAdder.h"
 #include "TorqueOnBodiesAdder.h"
-#include "ForceTorqueOnBodiesResetter.h"
-#include "ForceTorqueOnBodiesScaler.h"
-#include "LubricationCorrection.h"
-#include "TimeStep.h"
+
+#include "core/math/Vector3.h"
+#include "domain_decomposition/StructuredBlockStorage.h"
+#include "pe/rigidbody/BodyIterators.h"
+
+
+namespace walberla {
+namespace pe_coupling {
+
+void TorqueOnBodiesAdder::operator()()
+{
+   for( auto blockIt = blockStorage_->begin(); blockIt != blockStorage_->end(); ++blockIt )
+   {
+      for( auto bodyIt = pe::LocalBodyIterator::begin( *blockIt, bodyStorageID_); bodyIt != pe::LocalBodyIterator::end(); ++bodyIt )
+      {
+         if( !bodySelectorFct_(bodyIt.getBodyID()) ) continue;
+         bodyIt->addTorque ( torque_ );
+      }
+   }
+}
+
+void TorqueOnBodiesAdder::updateTorque( const Vector3<real_t> & newTorque )
+{
+   torque_ = newTorque;
+}
+
+} // namespace pe_coupling
+} // namespace walberla

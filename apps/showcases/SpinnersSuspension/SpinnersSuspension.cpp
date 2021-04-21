@@ -97,7 +97,6 @@ struct Setup
     bool resolve_overlapping; // whether resolve initial particle overlappings
     uint_t resolve_maxsteps; // max resolve timesteps
     real_t resolve_dt; // time interval for resolving particle overlappings
-    real_t resolve_target; // target max particle overlappings
 
     std::string coupling_method;
     MEMVariant memVariant; // momentum exchange method
@@ -246,6 +245,9 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
                                 const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
 
+void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID,
+                              const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
+
 class ForceOnBodiesAdder
 {
 public:
@@ -339,7 +341,6 @@ int main(int argc, char** argv)
     setup.resolve_overlapping = simulationParameters.getParameter< bool >("resolve_overlapping");
     setup.resolve_maxsteps = simulationParameters.getParameter< uint_t >("resolve_maxsteps");
     setup.resolve_dt = simulationParameters.getParameter< real_t >("resolve_dt");
-    setup.resolve_target = simulationParameters.getParameter< real_t >("resolve_target");
 
     setup.substepsPE = simulationParameters.getParameter< uint_t >("substepsPE");
     setup.coupling_method = simulationParameters.getParameter< std::string >("coupling_method");
@@ -378,10 +379,18 @@ int main(int argc, char** argv)
     setup.frictionDCoeff = particleProperties.getParameter< real_t >("frictionDCoeff");
     setup.poisson = particleProperties.getParameter< real_t >("poisson");
     setup.young = particleProperties.getParameter< real_t >("young");
+    setup.stiffnessCoeff = particleProperties.getParameter< real_t >("stiffnessCoeff");
+    setup.dampingNCoeff = particleProperties.getParameter< real_t >("dampingNCoeff");
+    setup.dampingTCoeff = particleProperties.getParameter< real_t >("dampingTCoeff");
     setup.contactT = particleProperties.getParameter< real_t >("contactT");
 
     real_t mij = setup.particle_mass_avg * setup.particle_mass_avg / (setup.particle_mass_avg + setup.particle_mass_avg);
 
+    setup.contactT = real_t(2.0) * math::pi * mij / (std::sqrt(real_t(4) * mij * setup.stiffnessCoeff - setup.dampingNCoeff * setup.dampingNCoeff)); //formula from Uhlman
+
+    
+    // estimate from contact time
+    /*
     setup.stiffnessCoeff = math::pi * math::pi * mij / (setup.contactT * setup.contactT * (real_t(1.0) - 
     std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff) / 
     (math::pi * math::pi + std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
@@ -389,6 +398,8 @@ int main(int argc, char** argv)
     setup.dampingNCoeff = -real_t(2.0) * std::sqrt(mij * setup.stiffnessCoeff) * (std::log(setup.restitutionCoeff) / 
     std::sqrt(math::pi * math::pi + (std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
     setup.dampingTCoeff = setup.dampingNCoeff;
+    */
+    
 
     auto outputParameters = env.config()->getOneBlock("OutputParameters");
     setup.vtkBaseFolder = outputParameters.getParameter< std::string >("vtkBaseFolder");
@@ -454,8 +465,13 @@ int main(int argc, char** argv)
     // add data-handling for fine collision dection
     const auto fcdID = blocks->addBlockData(pe::fcd::createGenericFCDDataHandling< BodyTypeTuple, pe::fcd::AnalyticCollideFunctor >(), "fcd");
 
-    // add contact solver - using DEM soft contacts
-    const auto cr = make_shared< pe::cr::DEM >(globalBodyStorage, blocks->getBlockStoragePointer(), bodyStorageID, ccdID, fcdID);
+    // add contact solver - using soft contact model
+    //const auto cr = make_shared< pe::cr::DEM >(globalBodyStorage, blocks->getBlockStoragePointer(), bodyStorageID, ccdID, fcdID);
+    // add contact solver - using hard contact model
+    const auto cr = make_shared< pe::cr::HCSITS >(globalBodyStorage, blocks->getBlockStoragePointer(), bodyStorageID, ccdID, fcdID);
+    cr->setMaxIterations(10);
+    cr->setRelaxationParameter(0.75);
+    cr->setRelaxationModel( pe::cr::HardContactSemiImplicitTimesteppingSolvers::ApproximateInelasticCoulombContactByDecoupling );
 
     // define particle material
     auto peMaterial = pe::createMaterial("particleMat", setup.density_ratio, setup.restitutionCoeff, 
@@ -556,6 +572,18 @@ int main(int argc, char** argv)
     pdfCommunicationScheme.addPackInfo( make_shared< lbm::PdfFieldPackInfo< LatticeModel_T > >( pdfFieldID ) );
 
     //-------------
+    // PE-only initial simulations
+    //-------------
+
+    // resolve particle overlaps
+    if(setup.resolve_overlapping)
+    {
+        WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps Start-----");
+        resolve_particle_overlaps(blocks, bodyStorageID, cr, PEsyncCall, setup);
+        WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps End-----");
+    }
+
+    //-------------
     // Output setup
     //-------------
 
@@ -579,60 +607,35 @@ int main(int argc, char** argv)
 
     pdfFieldVTK->write();
 
-    // resolve particle overlaps
-    if(setup.resolve_overlapping)
-    {
-    // collision properties evaluator
-    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
-
-    const uint_t initialPEsteps = setup.resolve_maxsteps;
-    const real_t dt_DEM_init = setup.contactT / real_t(uint_c(10) * setup.substepsPE);
-    const real_t overlapTarget = setup.resolve_target * setup.particle_diameter_avg;
-
-    // temperary bounding plane
-    //auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
-
-    for (uint_t pestep = uint_c(0); pestep < initialPEsteps; ++pestep)
-    {
-        cr->timestep(dt_DEM_init);
-        PEsyncCall();
-
-        OverlapEvaluator->operator()();
-
-        real_t maxOverlap = OverlapEvaluator->getMaximumPenetration();
-
-        if (maxOverlap < overlapTarget)
-        {
-            WALBERLA_LOG_INFO_ON_ROOT("Carried out " << pestep << " PE-only steps to resolve initial overlaps.");
-            break;
-        }
-        else
-        {
-            if (pestep % setup.logInfoFrequency == uint_c(0))
-            {
-                WALBERLA_LOG_INFO_ON_ROOT("timestep: " << pestep << " - current max overlap = " << maxOverlap / setup.particle_diameter_avg * real_c(100) << "%");
-            }
-
-            if (pestep % setup.vtkWriteFrequency == uint_c(0))
-            {
-                bodyVTKWriter->write();
-            }
-        }
-
-        OverlapEvaluator->resetMaximumPenetration();
-    }
-
-    // destroy temperary bounding plane
-    //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
-
-    // comunication
-    PEsyncCall();
-    bodyVTKWriter->write();
-    }
-
     /////////////////////////
     //  Time loop
     /////////////////////////
+
+    // create sediments
+    cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.01), real_t(0.0)));
+    for (uint_t pestep = uint_c(0); pestep < 10000; ++pestep)
+    {
+        for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
+        {
+            for ( auto bodyIt = pe::BodyIterator::begin( *blockIt, bodyStorageID); bodyIt != pe::BodyIterator::end(); ++bodyIt)
+            {
+                Vector3<real_t> vel = bodyIt->getLinearVel();
+                vel[2] = real_c(0.0);
+                bodyIt->setLinearVel(vel);
+
+                //Vector3<real_t> ang(real_t(0.0), real_t(0.0), real_t(0.0001));
+                //bodyIt->setAngularVel(ang);
+            }
+        }
+        
+        cr->timestep(real_t(0.1));
+        PEsyncCall();
+
+        bodyVTKWriter->write();
+
+        if (pestep % setup.logInfoFrequency == uint_c(0))
+            WALBERLA_LOG_INFO_ON_ROOT("sediment timestep: " << pestep);
+    }
 
     return EXIT_SUCCESS;
 }
@@ -702,7 +705,50 @@ uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorag
     return N1 + N2;
 }
 
-} //namespace spinners_suspension_dpm
+void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID, 
+                               const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup)
+{
+    // collision properties evaluator
+    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
+
+    const uint_t PEsteps = setup.resolve_maxsteps;
+    const real_t dt = setup.resolve_dt;
+
+    // temperary bounding plane
+    //auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
+
+    for (uint_t pestep = uint_c(0); pestep < PEsteps; ++pestep)
+    {
+        cr->timestep(dt);
+        syncFunc();
+
+        // reset all velocities to zero
+        for( auto blockIt = blockStorage->begin(); blockIt != blockStorage->end(); ++blockIt)
+        {
+            for ( auto bodyIt = pe::BodyIterator::begin( *blockIt, bodyStorageID); bodyIt != pe::BodyIterator::end(); ++bodyIt)
+            {
+                bodyIt->setLinearVel(Vector3<real_t>(real_t(0.0)));
+                bodyIt->setAngularVel(Vector3<real_t>(real_t(0.0)));
+            }
+        }
+
+        OverlapEvaluator->operator()();
+
+        real_t maxOverlap = OverlapEvaluator->getMaximumPenetration();
+
+        WALBERLA_LOG_INFO_ON_ROOT("timestep: " << pestep << " - current max overlap = " << maxOverlap / setup.particle_diameter_avg * real_c(100) << "%");
+
+        OverlapEvaluator->resetMaximumPenetration();
+    }
+
+    // destroy temperary bounding plane
+    //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
+
+    // comunication
+    syncFunc();
+}
+
+} //namespace spinners_suspension
 
 int main( int argc, char **argv){
     return spinners_suspension::main(argc, argv);
