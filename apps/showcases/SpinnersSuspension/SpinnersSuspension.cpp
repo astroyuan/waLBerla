@@ -64,7 +64,7 @@ using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
 
 const FlagUID Fluid_Flag ( "fluid" );
 
-const FlagUID NoSlip_Falg ("no slip");
+const FlagUID NoSlip_Flag ("no slip");
 const FlagUID UBB_Flag ( "velocity bounce back" );
 const FlagUID Pressure_Flag ( "pressure" );
 
@@ -371,7 +371,7 @@ int main(int argc, char** argv)
     setup.particle_diameter_max = std::max(setup.particle_diameter_1, setup.particle_diameter_2);
     setup.particle_diameter_avg = (setup.particle_diameter_1 + setup.particle_diameter_2) / real_t(2.0);
     setup.particle_volume_avg = setup.particle_diameter_avg * setup.particle_diameter_avg * setup.particle_diameter_avg * math::pi / real_t(6.0);
-    setup.particle_mass_avg = setup.density_ratio * setup.particle_volume_avg;
+    setup.particle_mass_avg = setup.particle_density * setup.particle_volume_avg;
 
     // collision related material properties
     setup.restitutionCoeff = particleProperties.getParameter< real_t >("restitutionCoeff");
@@ -386,11 +386,10 @@ int main(int argc, char** argv)
 
     real_t mij = setup.particle_mass_avg * setup.particle_mass_avg / (setup.particle_mass_avg + setup.particle_mass_avg);
 
-    setup.contactT = real_t(2.0) * math::pi * mij / (std::sqrt(real_t(4) * mij * setup.stiffnessCoeff - setup.dampingNCoeff * setup.dampingNCoeff)); //formula from Uhlman
+    //setup.contactT = real_t(2.0) * math::pi * mij / (std::sqrt(real_t(4) * mij * setup.stiffnessCoeff - setup.dampingNCoeff * setup.dampingNCoeff)); //formula from Uhlman
 
-    
     // estimate from contact time
-    /*
+
     setup.stiffnessCoeff = math::pi * math::pi * mij / (setup.contactT * setup.contactT * (real_t(1.0) - 
     std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff) / 
     (math::pi * math::pi + std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
@@ -398,8 +397,6 @@ int main(int argc, char** argv)
     setup.dampingNCoeff = -real_t(2.0) * std::sqrt(mij * setup.stiffnessCoeff) * (std::log(setup.restitutionCoeff) / 
     std::sqrt(math::pi * math::pi + (std::log(setup.restitutionCoeff) * std::log(setup.restitutionCoeff))));
     setup.dampingTCoeff = setup.dampingNCoeff;
-    */
-    
 
     auto outputParameters = env.config()->getOneBlock("OutputParameters");
     setup.vtkBaseFolder = outputParameters.getParameter< std::string >("vtkBaseFolder");
@@ -407,7 +404,7 @@ int main(int argc, char** argv)
     setup.logInfoFrequency = outputParameters.getParameter< uint_t >("logInfoFrequency");
 
     // check sanity of input parameters
-    //setup.sanity_check();
+    setup.sanity_check();
     
     setup.printSetup();
 
@@ -445,7 +442,7 @@ int main(int argc, char** argv)
                                                       0, false, false,
                                                       xPeriodic, yPeriodic, zPeriodic,
                                                       false);
-
+    WALBERLA_LOG_INFO_ON_ROOT( mpi::MPIManager::instance()->numProcesses());
     //--------------
     // PE setup
     //--------------
@@ -475,7 +472,7 @@ int main(int argc, char** argv)
 
     // define particle material
     auto peMaterial = pe::createMaterial("particleMat", setup.density_ratio, setup.restitutionCoeff, 
-    setup.frictionSCoeff, setup.frictionDCoeff, setup.poisson, setup.young, 
+    setup.frictionSCoeff, setup.frictionDCoeff, setup.poisson, setup.young,
     setup.stiffnessCoeff, setup.dampingNCoeff, setup.dampingTCoeff);
 
     WALBERLA_LOG_INFO_ON_ROOT("Summary of particle material properties:\n"
@@ -532,9 +529,11 @@ int main(int argc, char** argv)
 
     // random generation of spherical particles
     setup.numParticles = generateRandomSpheresLayer(*blocks, *globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
+    WALBERLA_LOG_INFO_ON_ROOT("REACH HERE." << XBlocks);
 
     // sync the created particles between processes
     PEsyncCall();
+    WALBERLA_LOG_INFO_ON_ROOT("REACH HERE.");
 
     WALBERLA_LOG_INFO_ON_ROOT(setup.numParticles << " spheres created.");
 
@@ -559,11 +558,14 @@ int main(int argc, char** argv)
 
     // mapping rigid bodies into LBM grids
     if ( setup.memVariant == MEMVariant::BB)
-        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_BB_Flag);
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_BB_Flag, pe_coupling::selectRegularBodies );
     else if ( setup.memVariant == MEMVariant::CLI)
-        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_CLI_Flag);
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_CLI_Flag, pe_coupling::selectRegularBodies );
     else
         WALBERLA_ABORT("Unsupported coupling method.");
+    
+    // mapping bound walls into LBM grids
+    //pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, NoSlip_Flag, pe_coupling::selectGlobalBodies );
 
     //---------------------
     // setup LBM communication scheme
@@ -612,8 +614,8 @@ int main(int argc, char** argv)
     /////////////////////////
 
     // create sediments
-    cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.01), real_t(0.0)));
-    for (uint_t pestep = uint_c(0); pestep < 10000; ++pestep)
+    cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.001), real_t(0.0)));
+    for (uint_t pestep = uint_c(0); pestep < 100000; ++pestep)
     {
         for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
         {
@@ -623,11 +625,11 @@ int main(int argc, char** argv)
                 vel[2] = real_c(0.0);
                 bodyIt->setLinearVel(vel);
 
-                //Vector3<real_t> ang(real_t(0.0), real_t(0.0), real_t(0.0001));
-                //bodyIt->setAngularVel(ang);
+                Vector3<real_t> ang(real_t(0.0), real_t(0.0), real_t(0.001));
+                bodyIt->setAngularVel(ang);
             }
         }
-        
+
         cr->timestep(real_t(0.1));
         PEsyncCall();
 
