@@ -83,6 +83,7 @@ struct Setup
 {
     // domain parameters
     Vector3< uint_t > numBlocks; // number of blocks in x,y,z direction
+    Vector3< uint_t > numCells; // number of cells in x,y,z direction
     Vector3< uint_t > domainSize; // domian size in x,y,z direction
     Vector3< bool > isPeriodic; // whether periodic in x,y,z direction
     bool boundX; // bounding walls in x-axis
@@ -92,7 +93,7 @@ struct Setup
     // simulation parameters
     uint_t timesteps; // simulation time steps
     real_t dt; // time interval
-    real_t dx;
+    real_t dx; // lattice spacing
 
     bool resolve_overlapping; // whether resolve initial particle overlappings
     uint_t resolve_maxsteps; // max resolve timesteps
@@ -142,8 +143,13 @@ struct Setup
     void printSetup()
     {
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(numBlocks);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(numCells);
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(domainSize);
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(isPeriodic);
+
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(boundX);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(boundY);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(boundZ);
 
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_density);
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(fluid_density);
@@ -156,6 +162,8 @@ struct Setup
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(particle_mass_avg);
 
         WALBERLA_LOG_DEVEL_VAR_ON_ROOT(vtkBaseFolder);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(vtkWriteFrequency);
+        WALBERLA_LOG_DEVEL_VAR_ON_ROOT(logInfoFrequency);
     }
 
     void sanity_check()
@@ -166,6 +174,10 @@ struct Setup
             WALBERLA_ABORT("The number of blocks in any periodic direction must not be smaller than 3.");
         if ( isPeriodic[2] == true && numBlocks[2] < uint_c(3) )
             WALBERLA_ABORT("The number of blocks in any periodic direction must not be smaller than 3.");
+
+        if (numBlocks[0] * numCells[0] != domainSize[0] || numBlocks[1] * numCells[1] != domainSize[1] || numBlocks[2] * numCells[2] != domainSize[2])
+            WALBERLA_ABORT("Domain decomposition does not fit the simulation domain.");
+
 
         WALBERLA_CHECK(particle_diameter_1 > 0 && particle_diameter_2 > 0, "particle diamters should be positive.");
     }
@@ -242,10 +254,9 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 /////////////////////////
 // auxiliary functions
 /////////////////////////
-uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
+uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                                 const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
-
-void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID,
+void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID,
                               const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
 
 class ForceOnBodiesAdder
@@ -403,16 +414,7 @@ int main(int argc, char** argv)
     setup.vtkWriteFrequency = outputParameters.getParameter< uint_t >("vtkWriteFrequency");
     setup.logInfoFrequency = outputParameters.getParameter< uint_t >("logInfoFrequency");
 
-    // check sanity of input parameters
-    setup.sanity_check();
-    
-    setup.printSetup();
-
-    ////////////////////////////
-    // simulation setup
-    ////////////////////////////
-
-    // simulation domain
+    // configure block decomposition
     const uint_t XBlocks = setup.numBlocks[0];
     const uint_t YBlocks = setup.numBlocks[1];
     const uint_t ZBlocks = setup.numBlocks[2];
@@ -429,8 +431,18 @@ int main(int argc, char** argv)
     const uint_t YCells = Ly / YBlocks;
     const uint_t ZCells = Lz / ZBlocks;
 
-    if (XBlocks * XCells != Lx || YBlocks * YCells != Ly || ZBlocks * ZCells != Lz) WALBERLA_ABORT("Domain Decomposition Failed.");
+    setup.numCells = Vector3<uint_t>(XCells, YCells, ZCells);
 
+    // check sanity of input parameters
+    setup.sanity_check();
+    
+    setup.printSetup();
+
+    ////////////////////////////
+    // simulation setup
+    ////////////////////////////
+
+    // simulation domain
     const auto domainSimulation = AABB(real_c(0.0), real_c(0.0), real_c(0.0),
     real_c(setup.domainSize[0]), real_c(setup.domainSize[1]), real_c(setup.domainSize[2]) );
 
@@ -439,10 +451,9 @@ int main(int argc, char** argv)
     auto blocks = blockforest::createUniformBlockGrid(XBlocks, YBlocks, ZBlocks, 
                                                       XCells, YCells, ZCells,
                                                       setup.dx,
-                                                      0, false, false,
-                                                      xPeriodic, yPeriodic, zPeriodic,
-                                                      false);
-    WALBERLA_LOG_INFO_ON_ROOT( mpi::MPIManager::instance()->numProcesses());
+                                                      true,
+                                                      xPeriodic, yPeriodic, zPeriodic);
+
     //--------------
     // PE setup
     //--------------
@@ -469,6 +480,15 @@ int main(int argc, char** argv)
     cr->setMaxIterations(10);
     cr->setRelaxationParameter(0.75);
     cr->setRelaxationModel( pe::cr::HardContactSemiImplicitTimesteppingSolvers::ApproximateInelasticCoulombContactByDecoupling );
+
+    // set up synchronization procedure
+    const real_t overlap = real_c( 1.5 ) * setup.dx;
+
+    std::function<void(void)> PEsyncCall;
+    if ( XBlocks <= uint_t(4) )
+        PEsyncCall = std::bind( pe::syncNextNeighbors<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
+    else
+        PEsyncCall = std::bind( pe::syncShadowOwners<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
 
     // define particle material
     auto peMaterial = pe::createMaterial("particleMat", setup.density_ratio, setup.restitutionCoeff, 
@@ -507,14 +527,6 @@ int main(int argc, char** argv)
         WALBERLA_LOG_INFO_ON_ROOT("Bounding walls in the x direction created.");
     }
 
-    // set up synchronization procedure
-    const real_t overlap = real_c( 1.5 ) * setup.dx;
-    std::function<void(void)> PEsyncCall;
-    if ( XBlocks <= uint_t(4) )
-        PEsyncCall = std::bind( pe::syncNextNeighbors<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
-    else
-        PEsyncCall = std::bind( pe::syncShadowOwners<BodyTypeTuple>, std::ref(blocks->getBlockForest()), bodyStorageID, static_cast<WcTimingTree*>(nullptr), overlap, false);
-
     ////////////////////////////
     // Initialization
     ////////////////////////////
@@ -528,12 +540,10 @@ int main(int argc, char** argv)
                                        domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
 
     // random generation of spherical particles
-    setup.numParticles = generateRandomSpheresLayer(*blocks, *globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
-    WALBERLA_LOG_INFO_ON_ROOT("REACH HERE." << XBlocks);
+    setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
 
     // sync the created particles between processes
     PEsyncCall();
-    WALBERLA_LOG_INFO_ON_ROOT("REACH HERE.");
 
     WALBERLA_LOG_INFO_ON_ROOT(setup.numParticles << " spheres created.");
 
@@ -614,7 +624,7 @@ int main(int argc, char** argv)
     /////////////////////////
 
     // create sediments
-    cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.001), real_t(0.0)));
+    cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.0001), real_t(0.0)));
     for (uint_t pestep = uint_c(0); pestep < 100000; ++pestep)
     {
         for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
@@ -642,7 +652,7 @@ int main(int argc, char** argv)
     return EXIT_SUCCESS;
 }
 
-uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorage & globalBodyStorage, const BlockDataID & bodyStorageID,
+uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                                 const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos)
 {
     //Randomly generate certain number of bidisperse spheres inside a specified domain
@@ -673,9 +683,12 @@ uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorag
             mpi::broadcastObject(diameter);
         }
 
-        pe::SphereID sp = pe::createSphere( globalBodyStorage, forest.getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
+        //pe::SphereID sp = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
 
-        if (sp != nullptr) ++N1;
+        //if (sp != nullptr) ++N1;
+
+        pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
+        ++N1;
     }
 
     WALBERLA_LOG_INFO_ON_ROOT("Creating " << setup.particle_number_2 << " type 2 spheres with diameter = " << setup.particle_diameter_2);
@@ -699,15 +712,18 @@ uint_t generateRandomSpheresLayer(StructuredBlockForest & forest, pe::BodyStorag
             mpi::broadcastObject(diameter);
         }
 
-        pe::SphereID sp = pe::createSphere( globalBodyStorage, forest.getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
+        //pe::SphereID sp = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
 
-        if (sp != nullptr) ++N2;
+        //if (sp != nullptr) ++N2;
+
+        pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
+        ++N2;
     }
 
     return N1 + N2;
 }
 
-void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID, 
+void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID, 
                                const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup)
 {
     // collision properties evaluator
@@ -725,7 +741,7 @@ void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blockS
         syncFunc();
 
         // reset all velocities to zero
-        for( auto blockIt = blockStorage->begin(); blockIt != blockStorage->end(); ++blockIt)
+        for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
         {
             for ( auto bodyIt = pe::BodyIterator::begin( *blockIt, bodyStorageID); bodyIt != pe::BodyIterator::end(); ++bodyIt)
             {
