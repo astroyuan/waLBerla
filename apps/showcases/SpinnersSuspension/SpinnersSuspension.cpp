@@ -86,6 +86,8 @@ struct Setup
     Vector3< uint_t > numCells; // number of cells in x,y,z direction
     Vector3< uint_t > domainSize; // domian size in x,y,z direction
     Vector3< bool > isPeriodic; // whether periodic in x,y,z direction
+    bool oneBlockPerProcess;
+
     bool boundX; // bounding walls in x-axis
     bool boundY; // bounding walls in y-axis
     bool boundZ; // bounding walls in z-axis
@@ -254,10 +256,12 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 /////////////////////////
 // auxiliary functions
 /////////////////////////
+uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
+                            pe::MaterialID & material, const Vector3<real_t> pos, const real_t diameter);
 uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
-                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
+                                  const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
 void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID,
-                              const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
+                               const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
 
 class ForceOnBodiesAdder
 {
@@ -340,6 +344,7 @@ int main(int argc, char** argv)
     setup.numBlocks = domainParameters.getParameter< Vector3< uint_t > >("numBlocks");
     setup.domainSize = domainParameters.getParameter< Vector3< uint_t > >("domainSize");
     setup.isPeriodic = domainParameters.getParameter < Vector3<  bool > >("isPeriodic");
+    setup.oneBlockPerProcess = domainParameters.getParameter< bool >("oneBlockPerProcess");
     setup.boundX = domainParameters.getParameter< bool >("boundX");
     setup.boundY = domainParameters.getParameter< bool >("boundY");
     setup.boundZ = domainParameters.getParameter< bool >("boundZ");
@@ -451,7 +456,7 @@ int main(int argc, char** argv)
     auto blocks = blockforest::createUniformBlockGrid(XBlocks, YBlocks, ZBlocks, 
                                                       XCells, YCells, ZCells,
                                                       setup.dx,
-                                                      true,
+                                                      setup.oneBlockPerProcess,
                                                       xPeriodic, yPeriodic, zPeriodic);
 
     //--------------
@@ -540,7 +545,9 @@ int main(int argc, char** argv)
                                        domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
 
     // random generation of spherical particles
-    setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
+    //setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
+
+    setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_t(Lx/2.0), real_t(Ly/2.0), real_t(0.0)), setup.particle_diameter_1);
 
     // sync the created particles between processes
     PEsyncCall();
@@ -624,6 +631,7 @@ int main(int argc, char** argv)
     /////////////////////////
 
     // create sediments
+    /*
     cr->setGlobalLinearAcceleration(Vector3< real_t >(real_t(0), real_t(-0.0001), real_t(0.0)));
     for (uint_t pestep = uint_c(0); pestep < 100000; ++pestep)
     {
@@ -640,7 +648,7 @@ int main(int argc, char** argv)
             }
         }
 
-        cr->timestep(real_t(0.1));
+        cr->timestep(real_t(0.25));
         PEsyncCall();
 
         bodyVTKWriter->write();
@@ -648,8 +656,21 @@ int main(int argc, char** argv)
         if (pestep % setup.logInfoFrequency == uint_c(0))
             WALBERLA_LOG_INFO_ON_ROOT("sediment timestep: " << pestep);
     }
+    */
 
     return EXIT_SUCCESS;
+}
+
+uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
+                            pe::MaterialID & material, const Vector3<real_t> pos, const real_t diameter)
+{
+    //generate a single sphere at specified location (x,y,z)
+
+    WALBERLA_LOG_INFO_ON_ROOT("Creating a sphere with diameter = " << diameter << " at location " << pos);
+
+    pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, pos, diameter * real_c(0.5), material);
+
+    return uint_t(1);
 }
 
 uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
