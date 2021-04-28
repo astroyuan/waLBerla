@@ -57,7 +57,7 @@ using Pressure_T = lbm::SimplePressure<LatticeModel_T, flag_t>;
 using MEM_BB_T = pe_coupling::SimpleBB<LatticeModel_T, FlagField_T>;
 using MEM_CLI_T = pe_coupling::CurvedLinear<LatticeModel_T, FlagField_T>;
 
-using BoundaryHandling_T = BoundaryHandling<FlagField_T, Stencil_T, UBB_T, Pressure_T, MEM_BB_T, MEM_CLI_T>;
+using BoundaryHandling_T = BoundaryHandling<FlagField_T, Stencil_T, NoSlip_T, UBB_T, Pressure_T, MEM_BB_T, MEM_CLI_T>;
 
 // body types
 using BodyTypeTuple = std::tuple< pe::Plane, pe::Sphere>;
@@ -106,12 +106,19 @@ struct Setup
     std::string coupling_method;
     MEMVariant memVariant; // momentum exchange method
 
-    uint_t substepsPE; // number of PE calls in each subcycle
+    uint_t numPEsubsteps; // number of PE calls in each time step
+    uint_t numLBMsubsteps; // number of LBM calls in each time step
 
     // fluid properties
     real_t fluid_density; // density of fluid
     real_t viscosity; // viscosity of fluid
     real_t omega;
+    real_t tau;
+
+    real_t u_ref; // characteristic velocity
+    real_t x_ref; // characteristic length scale
+    real_t t_ref; // characteristic time scale
+    real_t Re; // Reynolds number
 
     // particle properties
     real_t particle_density; // density of particles
@@ -138,8 +145,11 @@ struct Setup
     real_t dampingTCoeff; // damping coefficient in the tangential direction
 
     real_t density_ratio;
+    real_t accg; // gravitational acceleration
 
     // output parameters
+    std::string BaseFolder;
+
     std::string vtkBaseFolder;
     uint_t vtkWriteFrequency;
 
@@ -221,11 +231,13 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
     const auto fluid = flagField->getOrRegisterFlag(Fluid_Flag);
 
     BoundaryHandling_T * handling = new BoundaryHandling_T("moving obstacle boundary handling", flagField, fluid,
+                                                            NoSlip_T("NoSlip", NoSlip_Flag, pdfField),
                                                             UBB_T("UBB", UBB_Flag, pdfField, velocity_),
                                                             Pressure_T("Pressure", Pressure_Flag, pdfField, real_c(1.0)),
                                                             MEM_BB_T("MEM_BB", MEM_BB_Flag, pdfField, flagField, bodyField, fluid, *storage, *block),
                                                             MEM_CLI_T("MEM_CLI", MEM_CLI_Flag, pdfField, flagField, bodyField, fluid, *storage, *block));
     
+    const auto noslip = flagField->getFlag( NoSlip_Flag );
     const auto ubb = flagField->getFlag( UBB_Flag );
     const auto pressure = flagField->getFlag( Pressure_Flag );
 
@@ -241,13 +253,13 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 
     // south
     CellInterval south(domainBB.xMin(), domainBB.yMin(), domainBB.zMin(), domainBB.xMax(), domainBB.yMin(), domainBB.zMin());
-    storage->transformGlobalToBlockLocalCellInterval( south, *block);
-    handling->forceBoundary( ubb, south);
+    storage->transformGlobalToBlockLocalCellInterval( south, *block );
+    handling->forceBoundary( noslip, south );
 
     // north
     CellInterval north(domainBB.xMin(), domainBB.yMax(), domainBB.zMin(), domainBB.xMax(), domainBB.yMax(), domainBB.zMin());
-    storage->transformGlobalToBlockLocalCellInterval( south, *block);
-    handling->forceBoundary( pressure, north);
+    storage->transformGlobalToBlockLocalCellInterval( north, *block );
+    handling->forceBoundary( noslip, north );
 
     // West and East are periodic
 
@@ -265,15 +277,15 @@ uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, 
 uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                                   const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
 void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID,
-                               const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
+                               pe::cr::ICR & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
 
-class ForceOnBodiesAdder
+class ForceOnBodiesResetter
 {
 public:
 
-   ForceOnBodiesAdder( const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID,
-                       const Vector3<real_t> & forcePerVolume )
-         : blockStorage_( blockStorage ), bodyStorageID_( bodyStorageID ), forcePerVolume_( forcePerVolume )
+   ForceOnBodiesResetter( const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID,
+                       const uint_t & direction )
+         : blockStorage_( blockStorage ), bodyStorageID_( bodyStorageID ), direction_( direction )
    { }
 
    // set a force on all (only local, to avoid force duplication) bodies
@@ -283,8 +295,14 @@ public:
       {
          for( auto bodyIt = pe::LocalBodyIterator::begin( *blockIt, bodyStorageID_); bodyIt != pe::LocalBodyIterator::end(); ++bodyIt )
          {
-            real_t volume = bodyIt->getVolume();
-            bodyIt->addForce ( forcePerVolume_ * volume );
+            force_ = bodyIt->getForce();
+            force_[direction_] = real_t(0.0);
+            bodyIt->setForce ( force_ );
+
+            velocity_ = bodyIt->getLinearVel();
+            velocity_[direction_] = real_t(0.0);
+            bodyIt->setLinearVel(velocity_);
+            //bodyIt->resetForceAndTorque();
          }
       }
    }
@@ -293,7 +311,9 @@ private:
 
    shared_ptr<StructuredBlockStorage> blockStorage_;
    const BlockDataID bodyStorageID_;
-   Vector3<real_t> forcePerVolume_;
+   const uint_t direction_;
+   Vector3<real_t> force_;
+   Vector3<real_t> velocity_;
 };
 
 class CollisionPropertiesEvaluator
@@ -324,82 +344,99 @@ private:
    real_t maximumPenetration_;
 };
 
-class RestingSphereForceEvaluator
+class SpherePropertiesLogger
 {
 public:
-    RestingSphereForceEvaluator( SweepTimeloop* timeloop, const shared_ptr< StructuredBlockStorage > & blocks,
-                                 const BlockDataID & bodyStorageID, uint_t averageFreq, const std::string & basefolder):
-    timeloop_( timeloop ), blocks_( blocks ), bodyStorageID_( bodyStorageID ), averageFreq_( averageFreq )
+    SpherePropertiesLogger( const shared_ptr< SweepTimeloop > & timeloop, const shared_ptr< StructuredBlockStorage > & blocks,
+                            const BlockDataID & bodyStorageID, const uint_t logFreq, const std::string & basefolder, const std::string & filename):
+    timeloop_( timeloop ), blocks_( blocks ), bodyStorageID_( bodyStorageID ), logFreq_(logFreq)
     {
-        std::ofstream file;
-        filename_ = basefolder;
-        filename_ += "/log_fixed.txt";
-        file.open( filename_.c_str() );
-        file << "# f_drag_curr f_drag_ave\n";
-        file.close();
-    }
-
-    // evaluate forces
-    void operator()()
-    {
-        const uint_t timestep (timeloop_->getCurrentTimeStep()+1);
-
-        real_t currentForce = calcForce();
-        currentAverage_ += currentForce;
-
         WALBERLA_ROOT_SECTION()
         {
+            // write the file header
             std::ofstream file;
-            file.open( filename_.c_str(), std::ofstream::app);
-            file.precision(8);
-            file << timestep << "\t" << currentForce << "\t" << dragForceNew_ << std::endl;
+            filename_ = basefolder + '/' + filename;
+            file.open( filename_.c_str() );
+            file << "# timestep posX posY posZ velX velY velZ forceX forceY forceZ\n";
             file.close();
         }
-
-        if ( timestep % averageFreq_ != 0) return;
-
-        dragForceOld_ = dragForceNew_;
-        dragForceNew_ = currentAverage_ / real_c( averageFreq_ );
-        currentAverage_ = real_t(0);
     }
 
-    real_t getForceDiff() const
+    void operator()()
     {
-        return std::fabs( (dragForceNew_ - dragForceOld_ ) / dragForceOld_ );
+        timestep_ = timeloop_->getCurrentTimeStep();
+
+        Vector3<real_t> pos(real_t(0.0));
+        Vector3<real_t> vel(real_t(0.0));
+        Vector3<real_t> force(real_t(0.0));
+
+        for( auto blockIt = blocks_->begin(); blockIt != blocks_->end(); ++blockIt )
+        {
+            for( auto bodyIt = pe::LocalBodyIterator::begin( *blockIt, bodyStorageID_); bodyIt != pe::LocalBodyIterator::end(); ++bodyIt )
+            {
+                pos = bodyIt->getPosition();
+                vel = bodyIt->getLinearVel();
+                force = bodyIt->getForce();
+            }
+        }
+
+        WALBERLA_MPI_SECTION()
+        {
+            mpi::allReduceInplace( pos[0], mpi::SUM);
+            mpi::allReduceInplace( pos[1], mpi::SUM);
+            mpi::allReduceInplace( pos[2], mpi::SUM);
+
+            mpi::allReduceInplace( vel[0], mpi::SUM);
+            mpi::allReduceInplace( vel[1], mpi::SUM);
+            mpi::allReduceInplace( vel[2], mpi::SUM);
+
+            mpi::allReduceInplace( force[0], mpi::SUM);
+            mpi::allReduceInplace( force[1], mpi::SUM);
+            mpi::allReduceInplace( force[2], mpi::SUM);
+        }
+
+        pos_ = pos;
+        vel_ = vel;
+        force_ = force;
+
+        if( timestep_ % logFreq_ == 0)
+        {
+            writeFiles();
+        }
     }
 
-    real_t getForce() const
+    void writeFiles()
     {
-        return dragForceNew_;
+        WALBERLA_ROOT_SECTION()
+        {
+            // write quantites in current time step to files
+            std::ofstream file;
+            file.open( filename_.c_str(), std::ofstream::app );
+
+            file << timestep_ << ' '
+                 << pos_[0] << ' ' << pos_[1] << ' ' << pos_[2] << ' '
+                 << vel_[0] << ' ' << vel_[1] << ' ' << vel_[2] << ' '
+                 << force_[0] << ' ' << force_[1] << ' ' << force_[2] << ' '
+                 << "\n";
+            
+            file.close();
+        }
     }
 
 private:
     std::string filename_;
 
-    SweepTimeloop* timeloop_;
+    shared_ptr< SweepTimeloop > timeloop_;
 
     shared_ptr< StructuredBlockStorage > blocks_;
     const BlockDataID bodyStorageID_;
 
-    uint_t averageFreq_;
+    const uint_t logFreq_;
 
-    real_t currentAverage_ = real_t(0);
-    real_t dragForceOld_ = real_t(0);
-    real_t dragForceNew_ = real_t(0);
-
-    real_t calcForce()
-    {
-        real_t force( real_t(0.0) );
-        for( auto blockIt = blocks_->begin(); blockIt != blocks_->end(); ++blockIt )
-            for( auto bodyIt = pe::BodyIterator::begin<pe::Sphere>(*blockIt, bodyStorageID_); bodyIt != pe::BodyIterator::end<pe::Sphere>(); ++bodyIt )
-                force += bodyIt->getForce()[1];
-        
-        WALBERLA_MPI_SECTION()
-        {
-            mpi::allReduceInplace( force, mpi::SUM);
-        }
-        return force;
-    }
+    uint_t timestep_;
+    Vector3<real_t> pos_;
+    Vector3<real_t> vel_;
+    Vector3<real_t> force_;
 };
 
 //*******************************************************************************************************************
@@ -415,6 +452,8 @@ int main(int argc, char** argv)
     Environment env(argc, argv);
 
     if (argc < 2) { WALBERLA_ABORT("Please specify a parameter file as input argument."); }
+
+    //logging::Logging::instance()->setLogLevel(logging::Logging::LogLevel::DETAIL);
 
     Setup setup;
 
@@ -442,7 +481,8 @@ int main(int argc, char** argv)
     setup.resolve_maxsteps = simulationParameters.getParameter< uint_t >("resolve_maxsteps");
     setup.resolve_dt = simulationParameters.getParameter< real_t >("resolve_dt");
 
-    setup.substepsPE = simulationParameters.getParameter< uint_t >("substepsPE");
+    setup.numPEsubsteps = simulationParameters.getParameter< uint_t >("numPEsubsteps");
+    setup.numLBMsubsteps = simulationParameters.getParameter< uint_t >("numLBMsubsteps");
     setup.coupling_method = simulationParameters.getParameter< std::string >("coupling_method");
     if (setup.coupling_method == "MEM_BB")
         setup.memVariant = MEMVariant::BB;
@@ -492,24 +532,66 @@ int main(int argc, char** argv)
     //--------------------fluid parameters------------------------------//
     auto fluidProperties = env.config()->getOneBlock("FluidProperties");
     setup.fluid_density = fluidProperties.getParameter< real_t >("fluid_density");
-    setup.viscosity = fluidProperties.getParameter< real_t >("viscosity");
-    setup.omega = lbm::collision_model::omegaFromViscosity(setup.viscosity);
-
-    real_t Re_target = real_c(1.0);
-    real_t uIn = Re_target * setup.viscosity / setup.particle_diameter_avg;
-    Vector3< real_t > uInfty( real_t(0.0), uIn, real_t(0.0));
-    WALBERLA_LOG_INFO_ON_ROOT("viscosity: " << setup.viscosity);
-    WALBERLA_LOG_INFO_ON_ROOT("diameter: " << setup.particle_diameter_avg);
-    WALBERLA_LOG_INFO_ON_ROOT("u: " << uInfty);
-
     setup.density_ratio = setup.particle_density / setup.fluid_density;
+    setup.viscosity = fluidProperties.getParameter< real_t >("viscosity");
+
+    setup.u_ref = real_c(0.01); // settling speed
+    setup.x_ref = setup.particle_diameter_avg;
+    setup.t_ref = setup.x_ref / setup.u_ref;
+
+    setup.Re = real_c(1.0);
+    setup.viscosity = setup.u_ref * setup.x_ref / setup.Re;
+    setup.accg = setup.u_ref * setup.u_ref / ( (setup.density_ratio-real_c(1.0)) * setup.x_ref );
+    setup.omega = lbm::collision_model::omegaFromViscosity(setup.viscosity);
+    setup.tau = real_t(1.0) / setup.omega;
+
+    real_t uIn = 0.00;
+    Vector3< real_t > uInfty( real_t(0.0), uIn, real_t(0.0) );
+    WALBERLA_LOG_INFO_ON_ROOT("density ratio = " << setup.density_ratio);
+
+    WALBERLA_LOG_INFO_ON_ROOT("Summary of LB fluid properties:\n"
+                              << " - fluid density = " << setup.fluid_density << "\n"
+                              << " - Reynolds number = " << setup.Re << "\n"
+                              << " - characteristic velocity = " << setup.u_ref << "\n"
+                              << " - characteristic length scale = " << setup.x_ref << "\n"
+                              << " - characteristic time scale = " << setup.t_ref << "\n"
+                              << " - kinetic viscosity = " << setup.viscosity << "\n"
+                              << " - relaxation time = " << setup.tau << " omega = " << setup.omega << "\n"
+                              << " - gravitational acceleration = " << setup.accg << "\n");
 
     //--------------------output parameters------------------------------//
     auto outputParameters = env.config()->getOneBlock("OutputParameters");
+    setup.BaseFolder = outputParameters.getParameter< std::string >("BaseFolder");
+    WALBERLA_ROOT_SECTION()
+    {
+        // create base directory if it does not yet exist
+        filesystem::path basepath( setup.BaseFolder );
+        if( !filesystem::exists( basepath ) )
+            filesystem::create_directory( basepath );
+    }
+
     setup.vtkBaseFolder = outputParameters.getParameter< std::string >("vtkBaseFolder");
+    setup.vtkBaseFolder = setup.BaseFolder + '/' + setup.vtkBaseFolder;
     setup.vtkWriteFrequency = outputParameters.getParameter< uint_t >("vtkWriteFrequency");
+    WALBERLA_ROOT_SECTION()
+    {
+        // create base directory if it does not yet exist
+        filesystem::path vtkbasepath( setup.vtkBaseFolder );
+        if( !filesystem::exists( vtkbasepath ) )
+            filesystem::create_directory( vtkbasepath );
+    }
+
     setup.logBaseFolder = outputParameters.getParameter< std::string >("logBaseFolder");
+    setup.logBaseFolder = setup.BaseFolder + '/' + setup.logBaseFolder;
     setup.logInfoFrequency = outputParameters.getParameter< uint_t >("logInfoFrequency");
+    WALBERLA_ROOT_SECTION()
+    {
+        // create base directory if it does not yet exist
+        filesystem::path logbasepath( setup.logBaseFolder );
+        if( !filesystem::exists( logbasepath ) )
+            filesystem::create_directory( logbasepath );
+    }
+
 
     // configure block decomposition
     const uint_t XBlocks = setup.numBlocks[0];
@@ -533,7 +615,7 @@ int main(int argc, char** argv)
     // check sanity of input parameters
     setup.sanity_check();
     
-    setup.printSetup();
+    //setup.printSetup();
 
     ////////////////////////////
     // simulation setup
@@ -544,7 +626,6 @@ int main(int argc, char** argv)
     real_c(setup.domainSize[0]), real_c(setup.domainSize[1]), real_c(setup.domainSize[2]) );
 
     // create blockforect
-    //auto forest = blockforest::createBlockForest(domainSimulation, setup.numBlocks, setup.isPeriodic);
     auto blocks = blockforest::createUniformBlockGrid(XBlocks, YBlocks, ZBlocks, 
                                                       XCells, YCells, ZCells,
                                                       setup.dx,
@@ -639,7 +720,7 @@ int main(int argc, char** argv)
     // random generation of spherical particles
     //setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
 
-    setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_t(Lx/2.0), real_t(Ly/2.0), real_t(0.0)), setup.particle_diameter_1);
+    setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_c(Lx)/real_c(2.0), real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx), setup.particle_diameter_1);
 
     // sync the created particles between processes
     PEsyncCall();
@@ -654,7 +735,7 @@ int main(int argc, char** argv)
     LatticeModel_T latticeModel = LatticeModel_T( lbm::collision_model::TRT::constructWithMagicNumber( setup.omega, magicNumberTRT) );
 
     // add pdf field
-    BlockDataID pdfFieldID = lbm::addPdfFieldToStorage< LatticeModel_T >( blocks, "pdf field (zyxf)", latticeModel, uInfty, real_t(1.0), FieldGhostLayers, field::zyxf);
+    BlockDataID pdfFieldID = lbm::addPdfFieldToStorage< LatticeModel_T >( blocks, "pdf field (zyxf)", latticeModel, uInfty, setup.fluid_density, FieldGhostLayers, field::zyxf);
 
     // add flag field
     BlockDataID flagFieldID = field::addFlagFieldToStorage< FlagField_T >( blocks, "flag field" );
@@ -674,7 +755,7 @@ int main(int argc, char** argv)
         WALBERLA_ABORT("Unsupported coupling method.");
 
     // mapping bound walls into LBM grids
-    //pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, NoSlip_Flag, pe_coupling::selectGlobalBodies );
+    //pe_coupling::mapBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, NoSlip_Flag, pe_coupling::selectGlobalBodies );
 
     //---------------------
     // setup LBM communication scheme
@@ -690,7 +771,7 @@ int main(int argc, char** argv)
     if(setup.resolve_overlapping)
     {
         WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps Start-----");
-        resolve_particle_overlaps(blocks, bodyStorageID, cr, PEsyncCall, setup);
+        resolve_particle_overlaps(blocks, bodyStorageID, *cr, PEsyncCall, setup);
         WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps End-----");
     }
 
@@ -698,16 +779,20 @@ int main(int argc, char** argv)
     // Output setup
     //-------------
 
-    // add vtk output for the domain decomposition
+    // write vtk output for the domain decomposition
     vtk::writeDomainDecomposition(blocks, "domain_decomposition", setup.vtkBaseFolder);
 
     // add vtk output for particles
     const auto bodyVTKOutput = make_shared< pe::SphereVtkOutput >(bodyStorageID, blocks->getBlockStorage());
-    const auto bodyVTKWriter = vtk::createVTKOutput_PointData(bodyVTKOutput, "bodies", setup.vtkWriteFrequency, setup.vtkBaseFolder);
-    bodyVTKWriter->write();
+    const auto bodyVTK = vtk::createVTKOutput_PointData(bodyVTKOutput, "bodies", setup.vtkWriteFrequency, setup.vtkBaseFolder);
 
-    // add vtk output for fluid
-    auto pdfFieldVTK = vtk::createVTKOutput_BlockData( blocks, "fluid_field", setup.vtkWriteFrequency, 0, false, setup.vtkBaseFolder);
+    // add vtk output for flag field
+    auto flagFieldVTK = vtk::createVTKOutput_BlockData( blocks, "flag_field", setup.vtkWriteFrequency, 0, false, setup.vtkBaseFolder );
+    flagFieldVTK->addCellDataWriter( make_shared< field::VTKWriter< FlagField_T > >( flagFieldID, "FlagField") );
+
+    // add vtk output for fluid field
+    auto pdfFieldVTK = vtk::createVTKOutput_BlockData( blocks, "fluid_field", setup.vtkWriteFrequency, 0, false, setup.vtkBaseFolder );
+    //pdfFieldVTK->addBeforeFunction( pdfCommunicationScheme );
 
     field::FlagFieldCellFilter< FlagField_T > fluidFilter( flagFieldID );
     fluidFilter.addFlag( Fluid_Flag );
@@ -716,49 +801,102 @@ int main(int argc, char** argv)
     pdfFieldVTK->addCellDataWriter( make_shared< lbm::VelocityVTKWriter< LatticeModel_T, float > >( pdfFieldID, "VelocityFromPDF") );
     pdfFieldVTK->addCellDataWriter( make_shared< lbm::DensityVTKWriter<LatticeModel_T, float> >( pdfFieldID, "DensityFromPDF") );
 
-    //pdfFieldVTK->write();
-
     /////////////////////////
     //  Time loop
     /////////////////////////
 
-    SweepTimeloop timeloopInit( blocks->getBlockStorage(), 10000);
+    shared_ptr<SweepTimeloop> timeloop = make_shared<SweepTimeloop>( blocks->getBlockStorage(), setup.timesteps );
 
-    auto sweep = lbm::makeCellwiseSweep< LatticeModel_T, FlagField_T >( pdfFieldID, flagFieldID, Fluid_Flag );
-
-    // collision sweep
-    timeloopInit.add() << Sweep( lbm::makeCollideSweep( sweep ), "cell-wise LB collide sweep");
-
-    // LBM communication and boundary hanlding sweep
-    timeloopInit.add() << BeforeFunction( pdfCommunicationScheme, "LBM communication")
-                       << Sweep( BoundaryHandling_T::getBlockSweep( boundaryHandlingID ), "Boundary Handling");
+    // -----------------------------------------
+    // update body mapping into LBM grids
+    if( setup.memVariant == MEMVariant::BB )
+        timeloop->add() << Sweep( pe_coupling::BodyMapping< LatticeModel_T, BoundaryHandling_T >( blocks, pdfFieldID, boundaryHandlingID, bodyStorageID, globalBodyStorage, bodyFieldID, MEM_BB_Flag, FormerMEM_Flag, pe_coupling::selectRegularBodies), "Body Mapping");
+    else if ( setup.memVariant == MEMVariant::CLI )
+        timeloop->add() << Sweep( pe_coupling::BodyMapping< LatticeModel_T, BoundaryHandling_T >( blocks, pdfFieldID, boundaryHandlingID, bodyStorageID, globalBodyStorage, bodyFieldID, MEM_CLI_Flag, FormerMEM_Flag, pe_coupling::selectRegularBodies), "Body Mapping");
     
-    // streaming
-    timeloopInit.add() << Sweep( lbm::makeStreamSweep( sweep ), "cell-wise LB stream sweep");
+    // reconstruct missing pdfs
+    using ExtrapolationFinder_T = pe_coupling::SphereNormalExtrapolationDirectionFinder;
+    ExtrapolationFinder_T extrapolationFinder( blocks, bodyFieldID );
+    using Reconstructor_T = pe_coupling::ExtrapolationReconstructor<LatticeModel_T, BoundaryHandling_T, ExtrapolationFinder_T>;
+    Reconstructor_T reconstructor( blocks, boundaryHandlingID, bodyFieldID, extrapolationFinder, false );
+    timeloop->add() << Sweep( pe_coupling::PDFReconstruction< LatticeModel_T, BoundaryHandling_T, Reconstructor_T >( blocks, pdfFieldID, boundaryHandlingID, bodyStorageID, globalBodyStorage, bodyFieldID, reconstructor, FormerMEM_Flag, Fluid_Flag, pe_coupling::selectRegularBodies), "pdf Reconstruction");
+    // -----------------------------------------
 
-    // evaluate the drag force
-    shared_ptr< RestingSphereForceEvaluator > forceEval = make_shared< RestingSphereForceEvaluator >( &timeloopInit, blocks, bodyStorageID, 10, setup.vtkBaseFolder);
-    timeloopInit.addFuncAfterTimeStep( SharedFunctor< RestingSphereForceEvaluator >( forceEval ), "Evaluating drag force");
+    // -----------------------------------------
+    // excecute LBM collision and streaming
+    // -----------------------------------------
+    for( uint_t lbmstep = 0; lbmstep < setup.numLBMsubsteps; ++lbmstep)
+    {
+        auto sweep = lbm::makeCellwiseSweep< LatticeModel_T, FlagField_T >( pdfFieldID, flagFieldID, Fluid_Flag );
 
-    // reset all force and torque
-    timeloopInit.addFuncAfterTimeStep( pe_coupling::ForceTorqueOnBodiesResetter( blocks, bodyStorageID ), "Resetting force on body");
+        // collision sweep
+        timeloop->add() << Sweep( lbm::makeCollideSweep( sweep ), "cell-wise LB collide sweep" );
 
-    // output
-    timeloopInit.addFuncAfterTimeStep( vtk::writeFiles( pdfFieldVTK ), "VTK pdf field");
+        // LBM communication and boundary hanlding sweep
+        timeloop->add() << BeforeFunction( pdfCommunicationScheme, "LBM communication" )
+                        << Sweep( BoundaryHandling_T::getBlockSweep( boundaryHandlingID ), "Boundary Handling" );
+
+        // streaming
+        timeloop->add() << Sweep( lbm::makeStreamSweep( sweep ), "cell-wise LB stream sweep" );
+    }
+
+    if ( setup.numLBMsubsteps != uint_t(1) )
+        // average hydrodynamic forces if more than one substep
+        timeloop->addFuncAfterTimeStep( pe_coupling::ForceTorqueOnBodiesScaler( blocks, bodyStorageID, real_t(1.0) / real_c(setup.numLBMsubsteps) ), "Average forces over LBM substeps" );
+    // -----------------------------------------
+
+    // add external forces (gravity)
+    Vector3<real_t> forces_ext( real_t(0.0), - setup.accg * (setup.density_ratio - real_t(1.0)) * setup.particle_volume_avg, real_t(0.0) );
+    //Vector3<real_t> forces_ext( real_t(0.0), real_t(0.0), real_t(0.0) );
+    timeloop->addFuncAfterTimeStep( pe_coupling::ForceOnBodiesAdder( blocks, bodyStorageID, forces_ext ), "Add gravity and buoyancy forces");
+
+    // confine to 2D - remove z-component force
+    timeloop->addFuncAfterTimeStep( ForceOnBodiesResetter( blocks, bodyStorageID, uint_t(2) ), "Clear z-component force");
+
+    // log sphere properties
+    timeloop->addFuncAfterTimeStep( SpherePropertiesLogger( timeloop, blocks, bodyStorageID, uint_c(1), setup.logBaseFolder, "log_single_sphere.txt"), "Sphere Properties Logger");
+
+    // advance pe rigid body simulation
+    timeloop->addFuncAfterTimeStep( pe_coupling::TimeStep( blocks, bodyStorageID, *cr, PEsyncCall, real_c(setup.numLBMsubsteps) * setup.dt, setup.numPEsubsteps ), "PE steps" );
+
+    // VTK output
+    timeloop->addFuncAfterTimeStep( vtk::writeFiles( bodyVTK ), "VTK (particles data)");
+    timeloop->addFuncAfterTimeStep( vtk::writeFiles( flagFieldVTK ), "VTK (flag field data)");
+    timeloop->addFuncAfterTimeStep( vtk::writeFiles( pdfFieldVTK ), "VTK (fluid field data)");
 
     // timer
-    timeloopInit.addFuncAfterTimeStep( RemainingTimeLogger( timeloopInit.getNrOfTimeSteps(), real_t(30) ), "Remaining Time");
+    timeloop->addFuncAfterTimeStep( RemainingTimeLogger( timeloop->getNrOfTimeSteps(), real_t(30) ), "Remaining Time Logger");
 
-    // execute initial simulation
+    ////////////////////////
+    // execute simulation //
+    ////////////////////////
 
-    WcTimingPool timeloopInitTiming;
+    WcTimingPool timeloopTiming;
+    timeloop->run( timeloopTiming );
+    timeloopTiming.logResultOnRoot();
 
-    for( uint_t i = 1; i < 10000; ++i)
+    /*
+    for( uint_t i = 1; i < 20000; ++i)
     {
-        timeloopInit.singleStep( timeloopInitTiming );
+        for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
+        {
+            for ( auto bodyIt = pe::BodyIterator::begin( *blockIt, bodyStorageID); bodyIt != pe::BodyIterator::end(); ++bodyIt)
+            {
+                Vector3<real_t> vel = bodyIt->getLinearVel();
+                vel[1] = real_c(0.01);
+                bodyIt->setLinearVel(vel);
 
-        WALBERLA_LOG_INFO_ON_ROOT(" current force: " << forceEval->getForce() );
+                Vector3<real_t> ang(real_t(0.0), real_t(0.0), real_t(0.001*0));
+                bodyIt->setAngularVel(ang);
+            }
+        }
+
+        timeloop.singleStep( timeloopTiming );
+
+        if( i % setup.logInfoFrequency == 0)
+            WALBERLA_LOG_INFO_ON_ROOT("timestep: " << i << " current force: " << forceEval->getForce() );
     }
+    */
 
     // create sediments
     /*
@@ -798,7 +936,12 @@ uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, 
 
     WALBERLA_LOG_INFO_ON_ROOT("Creating a sphere with diameter = " << diameter << " at location " << pos);
 
-    pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, pos, diameter * real_c(0.5), material);
+    auto sphere = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, pos, diameter * real_c(0.5), material);
+
+    if (sphere != nullptr)
+    {
+        sphere->setLinearVel( real_t(0.0), -real_t(0.01) * real_t(0.01), real_t(0.0) );
+    }
 
     return uint_t(1);
 }
@@ -877,10 +1020,10 @@ uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & bl
 }
 
 void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID, 
-                               const shared_ptr<pe::cr::ICR> & cr, const std::function<void (void)> & syncFunc, const Setup & setup)
+                               pe::cr::ICR & cr, const std::function<void (void)> & syncFunc, const Setup & setup)
 {
     // collision properties evaluator
-    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(*cr);
+    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(cr);
 
     const uint_t PEsteps = setup.resolve_maxsteps;
     const real_t dt = setup.resolve_dt;
@@ -890,7 +1033,7 @@ void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks
 
     for (uint_t pestep = uint_c(0); pestep < PEsteps; ++pestep)
     {
-        cr->timestep(dt);
+        cr.timestep(dt);
         syncFunc();
 
         // reset all velocities to zero
@@ -915,7 +1058,7 @@ void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks
     // destroy temperary bounding plane
     //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
 
-    // comunication
+    // communication
     syncFunc();
 }
 
