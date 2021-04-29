@@ -753,15 +753,6 @@ int main(int argc, char** argv)
 
     // generate initial spherical particles
 
-    real_t layer_thickness = setup.dx;
-    real_t layer_zpos = real_c(0.5) * setup.dx;
-    real_t radius_max = setup.particle_diameter_max / real_c(2.0);
-    const auto domainGeneration = AABB(domainSimulation.xMin() + radius_max, domainSimulation.yMin() + radius_max, domainSimulation.zMin(), 
-                                       domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
-
-    // random generation of spherical particles
-    //setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
-
     setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_c(Lx)/real_c(2.0), real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx), setup.particle_diameter_1);
 
     // sync the created particles between processes
@@ -804,18 +795,6 @@ int main(int argc, char** argv)
     //---------------------------------//
     blockforest::communication::UniformBufferedScheme< Stencil_T > pdfCommunicationScheme( blocks );
     pdfCommunicationScheme.addPackInfo( make_shared< lbm::PdfFieldPackInfo< LatticeModel_T > >( pdfFieldID ) );
-
-    //------------------------------//
-    // PE-only initial simulations  //
-    //------------------------------//
-
-    // resolve particle overlaps
-    if(setup.resolve_overlapping)
-    {
-        WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps Start-----");
-        resolve_particle_overlaps(blocks, bodyStorageID, *cr, PEsyncCall, setup);
-        WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps End-----");
-    }
 
     //---------------//
     // Output Setup  //
@@ -941,122 +920,6 @@ uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, 
     }
 
     return uint_t(1);
-}
-
-uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
-                                const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos)
-{
-    //Randomly generate certain number of bidisperse spheres inside a specified domain
-
-    uint_t N1 = 0;
-    uint_t N2 = 0;
-
-    real_t xpos, ypos, zpos, diameter;
-
-    math::seedRandomGenerator( std::mt19937::result_type(std::time(nullptr)));
-
-    WALBERLA_LOG_INFO_ON_ROOT("Creating " << setup.particle_number_1 << " type 1 spheres with diameter = " << setup.particle_diameter_1);
-
-    while (N1 < setup.particle_number_1)
-    {
-        WALBERLA_ROOT_SECTION()
-        {
-            xpos = math::realRandom<real_t>(domainGeneration.xMin(), domainGeneration.xMax());
-            ypos = math::realRandom<real_t>(domainGeneration.yMin(), domainGeneration.yMax());
-            //zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
-            zpos = layer_zpos;
-            diameter = setup.particle_diameter_1;
-        }
-
-        WALBERLA_MPI_SECTION()
-        {
-            mpi::broadcastObject(xpos);
-            mpi::broadcastObject(ypos);
-            mpi::broadcastObject(zpos);
-            mpi::broadcastObject(diameter);
-        }
-
-        //pe::SphereID sp = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
-
-        //if (sp != nullptr) ++N1;
-
-        pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
-        ++N1;
-    }
-
-    WALBERLA_LOG_INFO_ON_ROOT("Creating " << setup.particle_number_2 << " type 2 spheres with diameter = " << setup.particle_diameter_2);
-
-    while (N2 < setup.particle_number_2)
-    {
-        WALBERLA_ROOT_SECTION()
-        {
-            xpos = math::realRandom<real_t>(domainGeneration.xMin(), domainGeneration.xMax());
-            ypos = math::realRandom<real_t>(domainGeneration.yMin(), domainGeneration.yMax());
-            //zpos = math::realRandom<real_t>(domainGeneration.zMin(), domainGeneration.zMax());
-            zpos = layer_zpos;
-            diameter = setup.particle_diameter_2;
-        }
-
-        WALBERLA_MPI_SECTION()
-        {
-            mpi::broadcastObject(xpos);
-            mpi::broadcastObject(ypos);
-            mpi::broadcastObject(zpos);
-            mpi::broadcastObject(diameter);
-        }
-
-        //pe::SphereID sp = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
-
-        //if (sp != nullptr) ++N2;
-
-        pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, Vector3<real_t>(xpos,ypos,zpos), diameter * real_c(0.5), material);
-        ++N2;
-    }
-
-    return N1 + N2;
-}
-
-void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID, 
-                               pe::cr::ICR & cr, const std::function<void (void)> & syncFunc, const Setup & setup)
-{
-    // collision properties evaluator
-    auto OverlapEvaluator = make_shared<CollisionPropertiesEvaluator>(cr);
-
-    const uint_t PEsteps = setup.resolve_maxsteps;
-    const real_t dt = setup.resolve_dt;
-
-    // temperary bounding plane
-    //auto boundingPlane = pe::createPlane(*globalBodyStorage, 1, Vector3<real_t>(0, 0, -1), Vector3<real_t>(0, 0, domainGeneration.zMax() + radius_max), peMaterial);
-
-    for (uint_t pestep = uint_c(0); pestep < PEsteps; ++pestep)
-    {
-        cr.timestep(dt);
-        syncFunc();
-
-        // reset all velocities to zero
-        for( auto blockIt = blocks->begin(); blockIt != blocks->end(); ++blockIt)
-        {
-            for ( auto bodyIt = pe::BodyIterator::begin( *blockIt, bodyStorageID); bodyIt != pe::BodyIterator::end(); ++bodyIt)
-            {
-                bodyIt->setLinearVel(Vector3<real_t>(real_t(0.0)));
-                bodyIt->setAngularVel(Vector3<real_t>(real_t(0.0)));
-            }
-        }
-
-        OverlapEvaluator->operator()();
-
-        real_t maxOverlap = OverlapEvaluator->getMaximumPenetration();
-
-        WALBERLA_LOG_INFO_ON_ROOT("timestep: " << pestep << " - current max overlap = " << maxOverlap / setup.particle_diameter_avg * real_c(100) << "%");
-
-        OverlapEvaluator->resetMaximumPenetration();
-    }
-
-    // destroy temperary bounding plane
-    //pe::destroyBodyBySID(*globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, boundingPlane->getSystemID());
-
-    // communication
-    syncFunc();
 }
 
 } //namespace spinners_suspension
