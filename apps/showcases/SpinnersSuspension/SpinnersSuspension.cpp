@@ -292,6 +292,8 @@ BoundaryHandling_T * MyBoundaryHandling::operator()( IBlock* const block, const 
 /////////////////////////
 uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                             pe::MaterialID & material, const Vector3<real_t> pos, const real_t diameter);
+uint_t generateTwoSpheres(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
+                            pe::MaterialID & material, const Vector3<real_t> pos1, const real_t diameter1, const Vector3<real_t> pos2, const real_t diameter2);
 uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                                   const Setup & setup, const AABB & domainGeneration, pe::MaterialID & material, real_t layer_zpos);
 void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID,
@@ -762,7 +764,12 @@ int main(int argc, char** argv)
     // random generation of spherical particles
     //setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
 
-    setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_c(Lx)/real_c(2.0), real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx), setup.particle_diameter_1);
+    //setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_c(Lx)/real_c(2.0), real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx), setup.particle_diameter_1);
+
+    real_t deltax = (setup.particle_diameter_1 * real_t(2.0)) / real_t(2.0);
+    Vector3<real_t> pos1( real_c(Lx)/real_c(2.0) - deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
+    Vector3<real_t> pos2( real_c(Lx)/real_c(2.0) + deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
+    setup.numParticles = generateTwoSpheres(blocks, globalBodyStorage, bodyStorageID, peMaterial, pos1, setup.particle_diameter_1, pos2, setup.particle_diameter_1);
 
     // sync the created particles between processes
     PEsyncCall();
@@ -941,6 +948,32 @@ uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, 
     }
 
     return uint_t(1);
+}
+
+uint_t generateTwoSpheres(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
+                            pe::MaterialID & material, const Vector3<real_t> pos1, const real_t diameter1, const Vector3<real_t> pos2, const real_t diameter2)
+{
+    //generate a single sphere at specified location (x,y,z)
+
+    WALBERLA_LOG_INFO_ON_ROOT("Creating a sphere with diameter = " << diameter1 << " at location " << pos1);
+
+    auto sphere1 = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, pos1, diameter1 * real_c(0.5), material);
+
+    if (sphere1 != nullptr)
+    {
+        sphere1->setLinearVel( real_t(0.0), -real_t(0.01) * real_t(0.01), real_t(0.0) );
+    }
+
+    WALBERLA_LOG_INFO_ON_ROOT("Creating a sphere with diameter = " << diameter2 << " at location " << pos2);
+
+    auto sphere2 = pe::createSphere( *globalBodyStorage, blocks->getBlockStorage(), bodyStorageID, 0, pos2, diameter2 * real_c(0.5), material);
+
+    if (sphere2 != nullptr)
+    {
+        sphere2->setLinearVel( real_t(0.0), -real_t(0.01) * real_t(0.01), real_t(0.0) );
+    }
+
+    return uint_t(2);
 }
 
 uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
