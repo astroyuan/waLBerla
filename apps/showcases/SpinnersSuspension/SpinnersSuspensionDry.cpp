@@ -154,6 +154,32 @@ uint_t generateRandomSpheresLayer(const shared_ptr< StructuredBlockForest > & bl
 void resolve_particle_overlaps(const shared_ptr<StructuredBlockStorage> & blocks, const BlockDataID & bodyStorageID,
                                pe::cr::ICR & cr, const std::function<void (void)> & syncFunc, const Setup & setup);
 
+class PrescribeAngularVel
+{
+public:
+
+   PrescribeAngularVel( const shared_ptr<StructuredBlockStorage> & blockStorage, const BlockDataID & bodyStorageID, const Vector3<real_t> & angular_velocity )
+         : blockStorage_( blockStorage ), bodyStorageID_( bodyStorageID ), angular_velocity_( angular_velocity )
+   { }
+
+   void operator()()
+   {
+      for( auto blockIt = blockStorage_->begin(); blockIt != blockStorage_->end(); ++blockIt )
+      {
+         for( auto bodyIt = pe::LocalBodyIterator::begin( *blockIt, bodyStorageID_); bodyIt != pe::LocalBodyIterator::end(); ++bodyIt )
+         {
+            bodyIt->setAngularVel( angular_velocity_ );
+         }
+      }
+   }
+
+private:
+
+   shared_ptr<StructuredBlockStorage> blockStorage_;
+   const BlockDataID bodyStorageID_;
+   Vector3<real_t> angular_velocity_;
+};
+
 class Enforce2D
 {
 public:
@@ -513,6 +539,10 @@ int main(int argc, char** argv)
     // add external forces (gravity)
     Vector3<real_t> forces_ext( real_t(0.0), - setup.accg * setup.particle_density * setup.particle_volume_avg, real_t(0.0) );
     timeloop->addFuncBeforeTimeStep( pe_coupling::ForceOnBodiesAdder( blocks, bodyStorageID, forces_ext ), "Add gravity and buoyancy forces");
+
+    // prescribe particle angular velocity
+    Vector3<real_t> angular_vel( real_t(0.0), real_t(0.0), real_t(2.0) * setup.u_ref / setup.x_ref );
+    timeloop->addFuncBeforeTimeStep( PrescribeAngularVel( blocks, bodyStorageID, angular_vel ), "Prescribe angular velocity of particles");
 
     // advance pe simulation
     timeloop->add() << Sweep( DummySweep(), "Dummy Sweep" )

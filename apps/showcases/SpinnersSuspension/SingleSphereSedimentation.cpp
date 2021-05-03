@@ -870,8 +870,8 @@ int main(int argc, char** argv)
         timeloop->addFuncAfterTimeStep( pe_coupling::ForceTorqueOnBodiesScaler( blocks, bodyStorageID, real_t(1.0) / real_c(setup.numLBMsubsteps) ), "Average forces over LBM substeps" );
 
     // prescribe particle angular velocity
-    Vector3<real_t> angular_vel( real_t(0.0), real_t(0.0), setup.u_ref / setup.x_ref );
-    timeloop->addFuncBeforeTimeStep( PrescribeAngularVel( blocks, bodyStorageID, angular_vel ), "Prescribe angular velocity of particles");
+    //Vector3<real_t> angular_vel( real_t(0.0), real_t(0.0), setup.u_ref / setup.x_ref );
+    //timeloop->addFuncBeforeTimeStep( PrescribeAngularVel( blocks, bodyStorageID, angular_vel ), "Prescribe angular velocity of particles");
 
     // add external forces (gravity)
     Vector3<real_t> forces_ext( real_t(0.0), - setup.accg * (setup.density_ratio - real_t(1.0)) * setup.particle_volume_avg, real_t(0.0) );

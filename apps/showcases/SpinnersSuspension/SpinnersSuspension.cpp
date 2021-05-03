@@ -484,6 +484,15 @@ private:
     Vector3<real_t> force_;
 };
 
+class DummySweep
+{
+public:
+    DummySweep() = default;
+
+    void operator()(IBlock* const /*block*/)
+    {}
+};
+
 //*******************************************************************************************************************
 /*!\brief Simulation of a population of rotating colloids in a 2D plane.
  *
@@ -762,14 +771,14 @@ int main(int argc, char** argv)
                                        domainSimulation.xMax() - radius_max, domainSimulation.yMax() - radius_max, domainSimulation.zMin() + layer_thickness);
 
     // random generation of spherical particles
-    //setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
+    setup.numParticles = generateRandomSpheresLayer(blocks, globalBodyStorage, bodyStorageID, setup, domainGeneration, peMaterial, layer_zpos);
 
     //setup.numParticles = generateSingleSphere(blocks, globalBodyStorage, bodyStorageID, peMaterial, Vector3<real_t>(real_c(Lx)/real_c(2.0), real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx), setup.particle_diameter_1);
 
-    real_t deltax = (setup.particle_diameter_1 * real_t(2.0)) / real_t(2.0);
-    Vector3<real_t> pos1( real_c(Lx)/real_c(2.0) - deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
-    Vector3<real_t> pos2( real_c(Lx)/real_c(2.0) + deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
-    setup.numParticles = generateTwoSpheres(blocks, globalBodyStorage, bodyStorageID, peMaterial, pos1, setup.particle_diameter_1, pos2, setup.particle_diameter_1);
+    //real_t deltax = (setup.particle_diameter_1 * real_t(1.2)) / real_t(2.0);
+    //Vector3<real_t> pos1( real_c(Lx)/real_c(2.0) - deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
+    //Vector3<real_t> pos2( real_c(Lx)/real_c(2.0) + deltax, real_c(Ly)/real_c(2.0), real_c(0.5) * setup.dx);
+    //setup.numParticles = generateTwoSpheres(blocks, globalBodyStorage, bodyStorageID, peMaterial, pos1, setup.particle_diameter_1, pos2, setup.particle_diameter_1);
 
     // sync the created particles between processes
     PEsyncCall();
@@ -795,17 +804,6 @@ int main(int argc, char** argv)
     // add boundary handling
     BlockDataID boundaryHandlingID = blocks->addStructuredBlockData< BoundaryHandling_T >( MyBoundaryHandling( flagFieldID, pdfFieldID, bodyFieldID, uInfty) );
 
-    // initial mapping from rigid bodies into LBM grids
-    if ( setup.memVariant == MEMVariant::BB)
-        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_BB_Flag, pe_coupling::selectRegularBodies );
-    else if ( setup.memVariant == MEMVariant::CLI)
-        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_CLI_Flag, pe_coupling::selectRegularBodies );
-    else
-        WALBERLA_ABORT("Unsupported coupling method.");
-
-    // mapping bound walls into LBM grids
-    //pe_coupling::mapBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, NoSlip_Flag, pe_coupling::selectGlobalBodies );
-
     //---------------------------------//
     // setup LBM communication scheme  //
     //---------------------------------//
@@ -823,6 +821,35 @@ int main(int argc, char** argv)
         resolve_particle_overlaps(blocks, bodyStorageID, *cr, PEsyncCall, setup);
         WALBERLA_LOG_INFO_ON_ROOT("-----Resolving Particle Overlaps End-----");
     }
+
+    // create initial sediments
+    shared_ptr<SweepTimeloop> timeloopInit = make_shared<SweepTimeloop>( blocks->getBlockStorage(), 200000 );
+
+    // add external forces (gravity)
+    Vector3<real_t> forces_ext_init( real_t(0.0), - setup.accg * setup.particle_density * setup.particle_volume_avg, real_t(0.0) );
+    timeloopInit->addFuncBeforeTimeStep( pe_coupling::ForceOnBodiesAdder( blocks, bodyStorageID, forces_ext_init ), "Add gravity and buoyancy forces");
+
+    // advance pe simulation
+    timeloopInit->add() << Sweep( DummySweep(), "Dummy Sweep" )
+                    << AfterFunction( pe_coupling::TimeStep( blocks, bodyStorageID, *cr, PEsyncCall, setup.dt, uint_t(1) ), "PE steps");
+
+    // confine to 2D plane - remove z-component force and velocity
+    timeloopInit->addFuncAfterTimeStep( Enforce2D( blocks, bodyStorageID, uint_t(2) ), "Enforce 2D simulation");
+
+    WcTimingPool timeloopTimingInit;
+    timeloopInit->run( timeloopTimingInit );
+    timeloopTimingInit.logResultOnRoot();
+
+    // initial mapping from rigid bodies into LBM grids
+    if ( setup.memVariant == MEMVariant::BB)
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_BB_Flag, pe_coupling::selectRegularBodies );
+    else if ( setup.memVariant == MEMVariant::CLI)
+        pe_coupling::mapMovingBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, MEM_CLI_Flag, pe_coupling::selectRegularBodies );
+    else
+        WALBERLA_ABORT("Unsupported coupling method.");
+
+    // mapping bound walls into LBM grids
+    //pe_coupling::mapBodies< BoundaryHandling_T >( *blocks, boundaryHandlingID, bodyStorageID, *globalBodyStorage, bodyFieldID, NoSlip_Flag, pe_coupling::selectGlobalBodies );
 
     //---------------//
     // Output Setup  //
@@ -867,7 +894,7 @@ int main(int argc, char** argv)
         timeloop->add() << Sweep( pe_coupling::BodyMapping< LatticeModel_T, BoundaryHandling_T >( blocks, pdfFieldID, boundaryHandlingID, bodyStorageID, globalBodyStorage, bodyFieldID, MEM_BB_Flag, FormerMEM_Flag, pe_coupling::selectRegularBodies), "Body Mapping");
     else if ( setup.memVariant == MEMVariant::CLI )
         timeloop->add() << Sweep( pe_coupling::BodyMapping< LatticeModel_T, BoundaryHandling_T >( blocks, pdfFieldID, boundaryHandlingID, bodyStorageID, globalBodyStorage, bodyFieldID, MEM_CLI_Flag, FormerMEM_Flag, pe_coupling::selectRegularBodies), "Body Mapping");
-    
+
     // reconstruct missing pdfs
     using ExtrapolationFinder_T = pe_coupling::SphereNormalExtrapolationDirectionFinder;
     ExtrapolationFinder_T extrapolationFinder( blocks, bodyFieldID );
@@ -898,11 +925,11 @@ int main(int argc, char** argv)
         timeloop->addFuncAfterTimeStep( pe_coupling::ForceTorqueOnBodiesScaler( blocks, bodyStorageID, real_t(1.0) / real_c(setup.numLBMsubsteps) ), "Average forces over LBM substeps" );
 
     // prescribe particle angular velocity
-    Vector3<real_t> angular_vel( real_t(0.0), real_t(0.0), setup.u_ref / setup.x_ref );
+    Vector3<real_t> angular_vel( real_t(0.0), real_t(0.0), real_t(0.5) * setup.u_ref / setup.x_ref );
     timeloop->addFuncBeforeTimeStep( PrescribeAngularVel( blocks, bodyStorageID, angular_vel ), "Prescribe angular velocity of particles");
 
     // add external forces (gravity)
-    Vector3<real_t> forces_ext( real_t(0.0), - setup.accg * (setup.density_ratio - real_t(1.0)) * setup.particle_volume_avg, real_t(0.0) );
+    Vector3<real_t> forces_ext( real_t(0.0), - real_t(0.1) * setup.accg * (setup.density_ratio - real_t(1.0)) * setup.particle_volume_avg, real_t(0.0) );
     timeloop->addFuncAfterTimeStep( pe_coupling::ForceOnBodiesAdder( blocks, bodyStorageID, forces_ext ), "Add gravity and buoyancy forces");
 
     // confine to 2D plane - remove z-component force and velocity
@@ -953,7 +980,7 @@ uint_t generateSingleSphere(const shared_ptr< StructuredBlockForest > & blocks, 
 uint_t generateTwoSpheres(const shared_ptr< StructuredBlockForest > & blocks, const shared_ptr<pe::BodyStorage> & globalBodyStorage, const BlockDataID & bodyStorageID,
                             pe::MaterialID & material, const Vector3<real_t> pos1, const real_t diameter1, const Vector3<real_t> pos2, const real_t diameter2)
 {
-    //generate a single sphere at specified location (x,y,z)
+    //generate a pair of spheres
 
     WALBERLA_LOG_INFO_ON_ROOT("Creating a sphere with diameter = " << diameter1 << " at location " << pos1);
 
